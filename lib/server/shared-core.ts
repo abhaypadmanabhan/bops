@@ -450,7 +450,10 @@ export function viewState(own: AppState, open: SharedOpen, data: SharedWsState, 
   const workspace: Workspace = { id: ws, name: open.name, createdAt: Number(s.workspace?.createdAt) || 0, ...(s.sites ? { botSites: s.sites } : {}) };
   const bots = s.bots.map((b) => ({ computerStatus: "none", role: "", color: "#0A0A0A", isMain: false, ...b, workspaceId: ws }) as unknown as Bot);
   const ids = new Set(bots.map((b) => b.id));
-  const chats = s.chats.map((c) => ({ botIds: [], createdAt: 0, ...c, typing: [], workspaceId: ws }) as unknown as Chat);
+  // Who's typing, from the stream's moods: the owner's Bops says a bot typing in a chat as "thinking" there
+  // (live-core.ts localMoods), so a teammate sees the dots the owner sees, not a reply that lands whole.
+  const typingIn = (chatId: string) => Object.entries(moods).filter(([id, m]) => ids.has(id) && m.mood === "thinking" && m.chatId === chatId).map(([id]) => id);
+  const chats = s.chats.map((c) => ({ botIds: [], createdAt: 0, ...c, typing: typingIn(String(c.id)), workspaceId: ws }) as unknown as Chat);
   // Bops' own lines in the owner's voice ("Stopped by you", "You approved $42", "Getting a browser ready on
   // your Mac") read as the owner's (ownerVoice): why a thread or a routine's last run stopped, a thread's
   // notes, its status steps (Bops', never what it typed, searched for or ran: those are as they were), the
