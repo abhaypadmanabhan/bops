@@ -24,8 +24,8 @@ export function plainStep(detail: string): string {
   if (/^ran\b/i.test(d)) {
     if (/urllib|requests|curl|wget|fetch\(/.test(d)) return "Looked things up online";
     if (/pdftoppm|pdfinfo|poppler|\.pdf\b/i.test(d)) return "Checked the PDF";
-    if (/\bnpm\b|\bnpx\b|\bpnpm\b|\byarn\b|apt-get|pip install/.test(d)) return "Set up the app";
-    if (/\bgit\b/.test(d)) return "Looked at the code history";
+    if (/\b(?:npm|pnpm|yarn) (?:ci|install|i|add)\b|\bplaywright install\b|\b(?:apt-get|apt|brew|pip3?) install\b/.test(d)) return "Set up the app";
+    if (/\bgit (?:log|show|diff|blame)\b/.test(d)) return "Looked at the code history";
     if (/pathlib|open\(|json|\bcat\b|\bls\b|\bcp\b|\bmv\b/.test(d)) return "Worked on the files";
     return "Ran a command";
   }

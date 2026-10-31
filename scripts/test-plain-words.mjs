@@ -24,6 +24,9 @@ check("steps are said as a person would", () => {
   assert.equal(plainStep("ran python3 - <<'PY' from pathlib import Path import json"), "Worked on the files");
   assert.equal(plainStep("ran npx playwright install --with-deps chromium"), "Set up the app");
   assert.equal(plainStep("ran pdftoppm -png camino-DRAFT.pdf page"), "Checked the PDF");
+  assert.equal(plainStep("ran git log --oneline -5"), "Looked at the code history");
+  assert.equal(plainStep("ran npm test"), "Ran a command", "a test run isn't setting the app up");
+  assert.equal(plainStep("ran git commit -m fix"), "Ran a command", "nor is a commit looking at history");
   assert.equal(plainStep("Read https://fourcorners.brandlord.agency/start?redirect=%2F"), "Read fourcorners.brandlord.agency");
   assert.equal(plainStep("Check the corrected draft itinerary"), "Check the corrected draft itinerary", "a step already in words stays");
 });
