@@ -89,8 +89,13 @@ const LinkedBy = createContext<string | undefined>(undefined);
  * fades in from a soft blur a moment after the one before (`motion-flow-word`), as Grok Bot's replies do.
  */
 const FlowStep = createContext(0);
-/** The words in some text, as the flow counts them. */
-const wordsIn = (text: string) => text.split(/\s+/).filter(Boolean).length;
+/** Inline's light markdown: a **bold** run, a [link](url) or a `code` span, each one piece. */
+const INLINE_MARKS = /(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`)/g;
+const inlineMark = (part: string) => /^`[^`\n]+`$/.test(part) || /^\*\*[^*]+\*\*$/.test(part) || /^\[[^\]]+\]\([^)\s]+\)$/.test(part);
+/** How many steps Inline gives some text when it flows: one per mark, one per word around them (as it draws them). */
+const flowSteps = (text: string) => text.split(INLINE_MARKS).reduce((n, part) => n + (inlineMark(part) ? 1 : (part.match(/\S+/g)?.length ?? 0)), 0);
+/** At least as many steps as Prose gives some text, whatever its tables and headings: counted line by line. */
+const flowStepsAtMost = (text: string) => text.split("\n").reduce((n, line) => n + flowSteps(line), 0);
 /** A word's (or a link's, a code span's) place in the flow, as the props of the element that shows it. */
 const flowAt = (step: number, at: number) => (step ? { className: "motion-flow-word", style: { animationDelay: `${at * step}ms` } } : { className: "", style: undefined });
 
@@ -101,10 +106,11 @@ export function Rich({ text, botId, flow }: { text: string; botId?: string; flow
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
   const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
   // Flowing in: 50ms between words, closer for a long reply so it's all there in about a second; a very long one
-  // just appears. Each block starts where the words before it left off (a code block is one step).
-  const words = wordsIn(text);
-  const step = flow && words <= 400 ? Math.min(50, Math.floor(900 / Math.max(1, words))) : 0;
-  const starts = blocks.reduce<number[]>((at, b, i) => [...at, i ? at[i - 1] + (i % 2 ? wordsIn(blocks[i - 1]) : 1) : 0], []);
+  // just appears. Each block starts after every step the one before it can take (a code block is one step), so
+  // nothing starts before what's above it.
+  const steps = blocks.reduce((n, b, i) => n + (i % 2 ? 1 : flowStepsAtMost(b)), 0);
+  const step = flow && steps <= 400 ? Math.min(50, Math.floor(900 / Math.max(1, steps))) : 0;
+  const starts = blocks.reduce<number[]>((at, b, i) => [...at, i ? at[i - 1] + (i % 2 ? flowStepsAtMost(blocks[i - 1]) : 1) : 0], []);
   return (
     <LinkedBy.Provider value={botId}>
       <FlowStep.Provider value={step}>
@@ -138,7 +144,7 @@ function Prose({ text, start = 0 }: { text: string; /** Its first word's place i
   const flush = () => {
     while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
     if (buf.length) out.push(<Inline key={`t${out.length}`} text={buf.join("\n")} start={at} />);
-    at += wordsIn(buf.join(" "));
+    at += flowSteps(buf.join("\n"));
     buf = [];
   };
   const skipBlank = () => {
@@ -226,7 +232,7 @@ function Inline({ text, start = 0 }: { text: string; /** Its first word's place 
     if (browser || !openLink) window.open(url, "_blank");
     else openLink(url, label);
   };
-  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`)/g);
+  const parts = text.split(INLINE_MARKS);
   // Flowing in: each word its own step, and a code span, a bold run or a link one step, in order.
   let at = start;
   const next = () => flowAt(step, at++);

@@ -76,6 +76,13 @@ check("in reading order across a paragraph, a heading, a code span, a link and a
   assert.deepEqual(delays, [...delays].sort((a, b) => a - b), "never a step back");
 });
 
+check("never a step back when marks and punctuation sit between words: each part starts after all the steps above it", () => {
+  assert.deepEqual(flowing(render("Use `git`, `ls`, and `pwd`.\n# Next\nDone.", true)), [
+    ["Use", 0], ["git", 50], [",", 100], ["ls", 150], [",", 200], ["and", 250], ["pwd", 300], [".", 350], ["Next", 400], ["Done.", 450],
+  ]);
+  assert.deepEqual(flowing(render("See `a` and `b`.\n```\nx\n```\nAfter.", true)).map(([, d]) => d), [0, 50, 100, 150, 200, 250, 300]);
+});
+
 check("a long reply's steps are closer, so it's all there in about a second; a very long one just appears", () => {
   const words = (n) => Array.from({ length: n }, (_, i) => `w${i}`).join(" ");
   const long = flowing(render(words(300), true));
