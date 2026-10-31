@@ -84,47 +84,24 @@ const blockerAsk = (state: AppState, b: Blocker) => (state.shared ? OWNER_BLOCKE
 
 /** The bot whose text this is, so a file it links opens from its computer (see Inline). */
 const LinkedBy = createContext<string | undefined>(undefined);
-/**
- * A reply flowing in (Rich's `flow`): how far apart its words start, in ms; 0 when it's all there at once. Each word
- * fades in from a soft blur a moment after the one before (`motion-flow-word`), as Grok Bot's replies do.
- */
-const FlowStep = createContext(0);
-/** Inline's light markdown: a **bold** run, a [link](url) or a `code` span, each one piece. */
-const INLINE_MARKS = /(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`)/g;
-const inlineMark = (part: string) => /^`[^`\n]+`$/.test(part) || /^\*\*[^*]+\*\*$/.test(part) || /^\[[^\]]+\]\([^)\s]+\)$/.test(part);
-/** How many steps Inline gives some text when it flows: one per mark, one per word around them (as it draws them). */
-const flowSteps = (text: string) => text.split(INLINE_MARKS).reduce((n, part) => n + (inlineMark(part) ? 1 : (part.match(/\S+/g)?.length ?? 0)), 0);
-/** At least as many steps as Prose gives some text, whatever its tables and headings: counted line by line. */
-const flowStepsAtMost = (text: string) => text.split("\n").reduce((n, line) => n + flowSteps(line), 0);
-/** A word's (or a link's, a code span's) place in the flow, as the props of the element that shows it. */
-const flowAt = (step: number, at: number) => (step ? { className: "motion-flow-word", style: { animationDelay: `${at * step}ms` } } : { className: "", style: undefined });
 
 /** A link to a file a bot made, not a web page: a path on its computer (/workspace/…) or on this Mac (~/…, /Users/…). */
 const isFileLink = (href: string) => /^(\/workspace\/|~\/|\/Users\/|file:\/\/\/)/.test(href);
 
-export function Rich({ text, botId, flow }: { text: string; botId?: string; flow?: boolean }) {
+export function Rich({ text, botId }: { text: string; botId?: string }) {
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
   const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
-  // Flowing in: 50ms between steps, closer when there are many so it's all there in about a second; a reply of
-  // over 400 words just appears. Each block starts after every step the one before it can take (a code block is
-  // one step), so nothing starts before what's above it.
-  const steps = blocks.reduce((n, b, i) => n + (i % 2 ? 1 : flowStepsAtMost(b)), 0);
-  const words = text.split(/\s+/).filter(Boolean).length;
-  const step = flow && words <= 400 ? Math.min(50, Math.floor(900 / Math.max(1, steps))) : 0;
-  const starts = blocks.reduce<number[]>((at, b, i) => [...at, i ? at[i - 1] + (i % 2 ? flowStepsAtMost(blocks[i - 1]) : 1) : 0], []);
   return (
     <LinkedBy.Provider value={botId}>
-      <FlowStep.Provider value={step}>
-        {blocks.map((b, i) => {
-          if (!(i % 2)) return <Prose key={i} text={b} start={starts[i]} />;
-          const f = flowAt(step, starts[i]);
-          return (
-            <pre key={i} style={f.style} className={`my-1.5 overflow-x-auto whitespace-pre rounded-xl bg-black/[0.045] px-3 py-2 font-mono text-[12px] leading-[17px] [overflow-wrap:normal] ${f.className}`}>
-              {b.replace(/\n$/, "")}
-            </pre>
-          );
-        })}
-      </FlowStep.Provider>
+      {blocks.map((b, i) =>
+        i % 2 ? (
+          <pre key={i} className="my-1.5 overflow-x-auto whitespace-pre rounded-xl bg-black/[0.045] px-3 py-2 font-mono text-[12px] leading-[17px] [overflow-wrap:normal]">
+            {b.replace(/\n$/, "")}
+          </pre>
+        ) : (
+          <Prose key={i} text={b} />
+        ),
+      )}
     </LinkedBy.Provider>
   );
 }
@@ -134,18 +111,14 @@ const isRule = (l: string) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$
 const cells = (l: string) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
 
 /** Text between code blocks: Markdown tables become real tables, "# Headings" bold lines, the rest inline text. */
-function Prose({ text, start = 0 }: { text: string; /** Its first word's place in a reply flowing in (Rich's flow). */ start?: number }) {
-  const step = useContext(FlowStep);
+function Prose({ text }: { text: string }) {
   const lines = text.split("\n");
   const out: React.ReactNode[] = [];
   let buf: string[] = [];
-  // Where the next part starts in the flow: each one after the words before it.
-  let at = start;
   // Blank lines around a table or heading would add a second gap on top of its own spacing.
   const flush = () => {
     while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
-    if (buf.length) out.push(<Inline key={`t${out.length}`} text={buf.join("\n")} start={at} />);
-    at += flowSteps(buf.join("\n"));
+    if (buf.length) out.push(<Inline key={`t${out.length}`} text={buf.join("\n")} />);
     buf = [];
   };
   const skipBlank = () => {
@@ -162,35 +135,30 @@ function Prose({ text, start = 0 }: { text: string; /** Its first word's place i
       while (i < lines.length && isRow(lines[i])) rows.push(cells(lines[i++]));
       i--;
       skipBlank();
-      const table = flowAt(step, at);
-      at += 1;
       out.push(
-        <span key={`g${out.length}`} style={table.style} className={`my-1.5 block overflow-x-auto ${table.className}`}>
-          {/* The table flows in whole: its cells' words don't on their own. */}
-          <FlowStep.Provider value={0}>
-            <table className="w-full border-collapse text-left text-[13px] leading-[18px]">
-              <thead>
-                <tr>
-                  {head.map((h, j) => (
-                    <th key={j} className="border-b border-black/10 px-2 py-1 font-semibold first:pl-0">
-                      <Inline text={h} />
-                    </th>
+        <span key={`g${out.length}`} className="my-1.5 block overflow-x-auto">
+          <table className="w-full border-collapse text-left text-[13px] leading-[18px]">
+            <thead>
+              <tr>
+                {head.map((h, j) => (
+                  <th key={j} className="border-b border-black/10 px-2 py-1 font-semibold first:pl-0">
+                    <Inline text={h} />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, k) => (
+                <tr key={k}>
+                  {r.map((c, j) => (
+                    <td key={j} className="border-b border-black/[0.06] px-2 py-1 align-top first:pl-0">
+                      <Inline text={c} />
+                    </td>
                   ))}
                 </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, k) => (
-                  <tr key={k}>
-                    {r.map((c, j) => (
-                      <td key={j} className="border-b border-black/[0.06] px-2 py-1 align-top first:pl-0">
-                        <Inline text={c} />
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </FlowStep.Provider>
+              ))}
+            </tbody>
+          </table>
         </span>,
       );
       continue;
@@ -198,10 +166,8 @@ function Prose({ text, start = 0 }: { text: string; /** Its first word's place i
     const heading = /^\s*#{1,4}\s+(.*)$/.exec(lines[i]);
     if (heading) {
       flush();
-      const title = flowAt(step, at);
-      at += 1;
       out.push(
-        <strong key={`h${out.length}`} style={title.style} className={`block font-semibold ${title.className}`}>
+        <strong key={`h${out.length}`} className="block font-semibold">
           {heading[1]}
         </strong>,
       );
@@ -215,8 +181,7 @@ function Prose({ text, start = 0 }: { text: string; /** Its first word's place i
 }
 
 /** Light inline markdown: **bold** and [links](url). */
-function Inline({ text, start = 0 }: { text: string; /** Its first word's place in a reply flowing in (Rich's flow). */ start?: number }) {
-  const step = useContext(FlowStep);
+function Inline({ text }: { text: string }) {
   // Links open as a tab on the right; ⌘-click still opens your browser. A page a bot made opens there too.
   // So does a file it linked: Bops fetches it from the bot's computer (or this Mac) first, as the link itself goes nowhere.
   const openLink = useContext(OpenLink);
@@ -233,32 +198,21 @@ function Inline({ text, start = 0 }: { text: string; /** Its first word's place 
     if (browser || !openLink) window.open(url, "_blank");
     else openLink(url, label);
   };
-  const parts = text.split(INLINE_MARKS);
-  // Flowing in: each word its own step, and a code span, a bold run or a link one step, in order.
-  let at = start;
-  const next = () => flowAt(step, at++);
+  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`)/g);
   return (
     <>
       {parts.map((p, i) => {
         // `code`: monospace, and it wraps like text (moves, ids, commands can be long).
         const code = /^`([^`\n]+)`$/.exec(p);
-        if (code) {
-          const f = next();
-          return <code key={i} style={f.style} className={`rounded-[5px] bg-black/[0.06] px-1 py-px font-mono text-[12.5px] [overflow-wrap:anywhere] ${f.className}`}>{code[1]}</code>;
-        }
+        if (code) return <code key={i} className="rounded-[5px] bg-black/[0.06] px-1 py-px font-mono text-[12.5px] [overflow-wrap:anywhere]">{code[1]}</code>;
         const bold = /^\*\*([^*]+)\*\*$/.exec(p);
-        if (bold) {
-          const f = next();
-          return <strong key={i} style={f.style} className={`font-semibold ${f.className}`}>{bold[1]}</strong>;
-        }
+        if (bold) return <strong key={i} className="font-semibold">{bold[1]}</strong>;
         const link = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(p);
         if (link) {
           const page = link[2].startsWith("/api/pages/");
-          const f = next();
           return (
             <a
               key={i}
-              style={f.style}
               href={link[2]}
               target="_blank"
               rel="noreferrer"
@@ -278,26 +232,13 @@ function Inline({ text, start = 0 }: { text: string; /** Its first word's place 
                 e.preventDefault();
                 openLink(page ? new URL(link[2], window.location.href).href : link[2], page ? link[1] : undefined);
               }}
-              className={`${page ? "inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-0.5 font-medium no-underline shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]" : "underline decoration-[#C9C9C6] underline-offset-2 hover:decoration-ink"} ${f.className}`}
+              className={page ? "inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-0.5 font-medium no-underline shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]" : "underline decoration-[#C9C9C6] underline-offset-2 hover:decoration-ink"}
             >
               {link[1]}
             </a>
           );
         }
-        if (!step) return <Fragment key={i}>{p}</Fragment>;
-        return (
-          <Fragment key={i}>
-            {p.split(/(\s+)/).map((w, j) =>
-              /\S/.test(w) ? (
-                <span key={j} {...next()}>
-                  {w}
-                </span>
-              ) : (
-                w
-              ),
-            )}
-          </Fragment>
-        );
+        return <Fragment key={i}>{p}</Fragment>;
       })}
       {failed && (
         <span role="alert" className="text-[12.5px] text-[#B42318]">
@@ -1885,8 +1826,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
               ) : (
                 (m.text || !m.images?.length) && (
                   <div className="whitespace-pre-wrap rounded-[18px] bg-[#F2F2F0] px-3.5 py-2 text-[14px] leading-5 [overflow-wrap:anywhere]">
-                    {/* A reply that came in while the chat was open flows in, word by word. */}
-                    <Rich text={withoutBriefing(m.text)} botId={m.botId} flow={enter?.className === "motion-rise-in"} />
+                    <Rich text={withoutBriefing(m.text)} botId={m.botId} />
                   </div>
                 )
               )}
