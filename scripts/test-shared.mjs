@@ -1340,6 +1340,7 @@ await check("the viewer's own Mac is never a shared workspace's: no Your Mac tab
   // The tab, were it shown: no Working dot for the owner's work.
   const bar = renderToStaticMarkup(h(TabBar, { state: st, tabs: [mac], active: "chat", chatBotId: "boppy", onPick: noop, onClose: noop, onNew: noop }));
   assert.ok(!/title="Working"/.test(bar), bar);
+  assert.match(bar, />Owner&#x27;s computer</, "the chat's computer tab is the owner's, not named for another bot");
   // The user's own: as always.
   const mine = { ...own(), host: "mac", sessions: [{ ...c.state.sessions[0], botId: "boppy" }] };
   assert.equal(tabsShown([mac], mine, opts(mine)).length, 1);
