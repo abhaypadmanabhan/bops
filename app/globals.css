@@ -687,6 +687,20 @@
   animation: rise-in 240ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
 }
 
+/*
+ * A reply that came in while the chat was open, word by word (chat-view.tsx Rich's flow): each word, code span or
+ * link from a soft blur, a moment after the one before, as Grok Bot's replies do.
+ */
+@keyframes flow-in {
+  from {
+    opacity: 0;
+    filter: blur(4px);
+  }
+}
+.motion-flow-word {
+  animation: flow-in 200ms ease-out backwards;
+}
+
 /* What you just sent: up from the composer, a touch smaller at first. */
 @keyframes send-in {
   from {
@@ -860,7 +874,8 @@
   .motion-tab-in,
   .motion-tick,
   .motion-dot-in,
-  .motion-typing-dot {
+  .motion-typing-dot,
+  .motion-flow-word {
     animation: none;
   }
 }
