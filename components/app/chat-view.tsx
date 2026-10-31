@@ -105,11 +105,12 @@ const isFileLink = (href: string) => /^(\/workspace\/|~\/|\/Users\/|file:\/\/\/)
 export function Rich({ text, botId, flow }: { text: string; botId?: string; flow?: boolean }) {
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
   const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
-  // Flowing in: 50ms between words, closer for a long reply so it's all there in about a second; a very long one
-  // just appears. Each block starts after every step the one before it can take (a code block is one step), so
-  // nothing starts before what's above it.
+  // Flowing in: 50ms between steps, closer when there are many so it's all there in about a second; a reply of
+  // over 400 words just appears. Each block starts after every step the one before it can take (a code block is
+  // one step), so nothing starts before what's above it.
   const steps = blocks.reduce((n, b, i) => n + (i % 2 ? 1 : flowStepsAtMost(b)), 0);
-  const step = flow && steps <= 400 ? Math.min(50, Math.floor(900 / Math.max(1, steps))) : 0;
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const step = flow && words <= 400 ? Math.min(50, Math.floor(900 / Math.max(1, steps))) : 0;
   const starts = blocks.reduce<number[]>((at, b, i) => [...at, i ? at[i - 1] + (i % 2 ? flowStepsAtMost(blocks[i - 1]) : 1) : 0], []);
   return (
     <LinkedBy.Provider value={botId}>

@@ -90,6 +90,7 @@ check("a long reply's steps are closer, so it's all there in about a second; a v
   assert.equal(long[1][1], 3, "900ms over 300 words: 3ms apart");
   assert.ok(long.at(-1)[1] <= 900);
   assert.equal(flowing(render(words(401), true)).length, 0);
+  assert.equal(flowing(render(`**${words(401)}**`, true)).length, 0, "counted in words, however they're marked");
 });
 
 check("history, and any reply without flow, is drawn as it always was", () => {
