@@ -771,7 +771,8 @@ function ChatRow({
         <div className="flex items-center gap-1.5">
           {/* The name first: it keeps its room, and the line beside it (its site, else its role) gives way. */}
           <span className={`truncate text-[15px] font-semibold leading-[18px] ${solo ? "shrink-0 max-w-[65%]" : ""}`}>{c.title ?? (solo ? solo.name : members.map((m) => m.name).join(", "))}</span>
-          {solo && (site || solo.role) && (
+          {/* Not when it only repeats the line under the name (a shared workspace's empty chat shows its role there). */}
+          {solo && (site || solo.role) && (site ?? solo.role) !== preview && (
             <span
               data-row-line={site ? "site" : "role"}
               title={site ? (solo.role ? `${solo.role}. Works on ${site}` : `Works on ${site}`) : solo.role}
