@@ -1364,7 +1364,12 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
   // Decided once, as the row mounts: a poll or a new tapback draws it again but never replays it.
   // Yours carries on its pending copy's motion (a negative delay starts it partway, or past the end).
   const [enter] = useState(() =>
-    !arrival ? undefined : arrival.kind === "send" ? { className: "motion-send-in", style: arrival.since ? { animationDelay: `${arrival.since - Date.now()}ms` } : undefined } : { className: "motion-rise-in", style: undefined },
+    !arrival
+      ? undefined
+      : arrival.kind === "send"
+        ? { className: "motion-send-in", style: arrival.since ? { animationDelay: `${arrival.since - Date.now()}ms` } : undefined }
+        : // A bot's reply arrives whole, with an entrance of its own; anything else that comes in rises in.
+          { className: m.role === "bot" ? "motion-reply-in" : "motion-rise-in", style: undefined },
   );
   const enterClass = enter?.className ?? "";
   // What was already here when the row mounted sits still: its tapbacks.
