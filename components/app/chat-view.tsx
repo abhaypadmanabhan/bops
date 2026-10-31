@@ -443,30 +443,29 @@ export function ChatView({
 
   // Opening a chat lands on its latest message; only new messages in the open chat glide in.
   const shownChat = useRef<string | null>(null);
-  // Whether the reader is at the latest message (so the chat follows it), and when the chat last scrolled itself.
+  // Whether the reader is at the latest message, so the chat follows it.
   const follow = useRef(true);
-  const ownScroll = useRef(0);
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
     follow.current = true;
-    ownScroll.current = Date.now();
     el.scrollTo({ top: el.scrollHeight, behavior: shownChat.current === c.id && !matchMedia("(prefers-reduced-motion: reduce)").matches ? "smooth" : "instant" });
     shownChat.current = c.id;
   }, [messages.length, c.typing.length, c.id]);
   // A reader at the bottom stays there when the column changes size (the side panel opening makes every bubble
-  // taller): they never land on old messages. One who scrolled up keeps their place.
+  // taller): they never land on old messages. One who scrolled up keeps their place. The chat only ever scrolls
+  // itself down, so moving up away from the bottom is always the reader's own.
   useEffect(() => {
     const el = scroller.current;
     if (!el || typeof ResizeObserver !== "function") return;
+    let top = el.scrollTop;
     const onScroll = () => {
-      if (Date.now() - ownScroll.current < 700) return;
-      follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 40) follow.current = true;
+      else if (el.scrollTop < top) follow.current = false;
+      top = el.scrollTop;
     };
     const ro = new ResizeObserver(() => {
-      if (!follow.current) return;
-      ownScroll.current = Date.now();
-      el.scrollTop = el.scrollHeight;
+      if (follow.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(el);
     for (const child of Array.from(el.children)) ro.observe(child);
