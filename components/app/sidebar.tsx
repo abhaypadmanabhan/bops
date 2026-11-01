@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { dropCitations } from "@/lib/plain-words";
 import { MAIN_WORKSPACE, waitingAsks, WORKSPACE_APPS_SINCE, workspaceOf, type AppState, type Chat, type Session, type Watch } from "@/lib/types";
 import { initialsOf, useSignOut } from "./account";
 import { AutopilotButton, AutopilotSections, type AutopilotOpen } from "./autopilot";
@@ -744,10 +745,10 @@ function ChatRow({
       ? last.role === "user"
         ? `${saidName(last, state) ?? ownerWho(state.shared)}: ${last.text}`
         : routine
-          ? `${undash(routine)}: ${last.text}`
+          ? `${undash(routine)}: ${dropCitations(last.text)}`
           : c.kind === "group" && last.botId
-          ? `${state.bots.find((b) => b.id === last.botId)?.name}: ${last.text}`
-          : last.text
+          ? `${state.bots.find((b) => b.id === last.botId)?.name}: ${dropCitations(last.text)}`
+          : dropCitations(last.text)
       : solo
         ? // A shared workspace's chats aren't the user's to start.
           state.shared

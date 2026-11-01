@@ -37,6 +37,7 @@ import { threadAgentWords, threadKind } from "./bot-ai";
 import { AgentChipPick, boxAgents, pickLine, useBotKeys } from "./new-thread";
 import { AskInPlace, ChatAvatar, chatName, clockTime, memberAnswers, needsYou, post, ReadOnlyLine, StatusIcon, teamOf, useNow } from "./ui";
 import { ReplyDrafts } from "./reply-drafts";
+import { dropCitations, plainStep } from "@/lib/plain-words";
 import { SkillProposals } from "./skill-proposals";
 
 /** Light markdown for bot text: **bold** and [links](url). */
@@ -90,7 +91,8 @@ const isFileLink = (href: string) => /^(\/workspace\/|~\/|\/Users\/|file:\/\/\/)
 
 export function Rich({ text, botId }: { text: string; botId?: string }) {
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
-  const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
+  // A model's citation markers are for it, not for people: they go.
+  const blocks = dropCitations(text).split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
   return (
     <LinkedBy.Provider value={botId}>
       {blocks.map((b, i) =>
@@ -2517,7 +2519,7 @@ export function ThreadSheet({
           {lines.map((l, i) =>
             l.kind === "note" ? (
               <p key={i} className="text-[14px] leading-[22px] [overflow-wrap:anywhere]">
-                {l.text}
+                {dropCitations(l.text)}
               </p>
             ) : l.kind === "steps" ? (
               <div key={i} className="flex flex-col gap-1 self-start">
@@ -2529,7 +2531,7 @@ export function ThreadSheet({
                     <rect x="1.5" y="2" width="11" height="7.5" rx="1.5" fill="none" stroke="#6B6B6B" strokeWidth="1.3" />
                     <path d="M5 12h4" fill="none" stroke="#6B6B6B" strokeWidth="1.3" strokeLinecap="round" />
                   </svg>
-                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{l.steps[l.steps.length - 1].detail}</span>
+                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{plainStep(l.steps[l.steps.length - 1].detail)}</span>
                   <span className="font-mono text-[11px] leading-[14px] text-[#9A9A98]">
                     {l.steps.length} step{l.steps.length === 1 ? "" : "s"} {openSteps.includes(i) ? "‹" : "›"}
                   </span>
