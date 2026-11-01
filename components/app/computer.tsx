@@ -1219,12 +1219,12 @@ function NoComputer({ state, bot: b, host }: { state: AppState; bot: Bot; /** Th
       </div>
     );
   // A workspace shared with the user: the computer (or the Mac) is the owner's, with nothing here to set up or watch.
+  // A plain line saying where its work shows, not an empty card the size of a screen.
   if (readOnly(state))
     return (
-      <div className="flex aspect-[16/10] w-full flex-col items-center justify-center gap-3 rounded-[20px] px-8 text-center" style={{ backgroundImage: botWash(b) }}>
-        <Mascot botId={b.id} color={b.color} size={44} />
-        <span className="max-w-[300px] text-[14px] leading-5">{`${b.name} works on ${b.runsOn === "mac" ? yourMac(state) : "the owner's computer"}.`}</span>
-      </div>
+      <p className="px-1 py-2 text-[14px] leading-5 text-[#6B6B6B]">
+        {`${b.name} works on ${b.runsOn === "mac" ? yourMac(state) : "the owner's computer"}. Its screens show only in the owner's Bops; its work shows in the chat.`}
+      </p>
     );
   return (
     <div className="flex aspect-[16/10] w-full flex-col items-center justify-center gap-3 rounded-[20px] px-8 text-center" style={{ backgroundImage: botWash(b) }}>
