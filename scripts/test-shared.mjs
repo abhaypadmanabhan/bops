@@ -535,7 +535,9 @@ await check("the window is shown the shared workspace in place of the user's own
     "its id is its own, never the user's ws_main",
   );
   assert.deepEqual(v.bots.map((b) => [b.name, b.workspaceId]), [["Dana's Boppy", WS]]);
-  assert.deepEqual(v.chats.map((c) => [c.id, c.workspaceId, c.typing]), [["bot:boppy", WS, []]]);
+  assert.deepEqual(v.chats.map((c) => [c.id, c.workspaceId, c.typing]), [["bot:boppy", WS, ["boppy"]]], "its bot thinking in the chat shows as typing there, as the owner sees it");
+  const busy = viewState(mine, { ...listed, wsId: WS }, data, { boppy: { mood: "working" } });
+  assert.deepEqual(busy.chats[0].typing, [], "a bot busy on a thread isn't typing in the chat");
   assert.deepEqual(v.messages.map((m) => m.text), ["Dana asked for leads"]);
   assert.equal(v.sessions[0].title, "Find leads");
   assert.equal(v.routines[0].title, "Morning brief");
