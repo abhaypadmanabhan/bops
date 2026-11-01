@@ -535,7 +535,9 @@ await check("the window is shown the shared workspace in place of the user's own
     "its id is its own, never the user's ws_main",
   );
   assert.deepEqual(v.bots.map((b) => [b.name, b.workspaceId]), [["Dana's Boppy", WS]]);
-  assert.deepEqual(v.chats.map((c) => [c.id, c.workspaceId, c.typing]), [["bot:boppy", WS, []]]);
+  assert.deepEqual(v.chats.map((c) => [c.id, c.workspaceId, c.typing]), [["bot:boppy", WS, ["boppy"]]], "its bot thinking in the chat shows as typing there, as the owner sees it");
+  const busy = viewState(mine, { ...listed, wsId: WS }, data, { boppy: { mood: "working" } });
+  assert.deepEqual(busy.chats[0].typing, [], "a bot busy on a thread isn't typing in the chat");
   assert.deepEqual(v.messages.map((m) => m.text), ["Dana asked for leads"]);
   assert.equal(v.sessions[0].title, "Find leads");
   assert.equal(v.routines[0].title, "Morning brief");
@@ -1340,6 +1342,7 @@ await check("the viewer's own Mac is never a shared workspace's: no Your Mac tab
   // The tab, were it shown: no Working dot for the owner's work.
   const bar = renderToStaticMarkup(h(TabBar, { state: st, tabs: [mac], active: "chat", chatBotId: "boppy", onPick: noop, onClose: noop, onNew: noop }));
   assert.ok(!/title="Working"/.test(bar), bar);
+  assert.match(bar, />Owner&#x27;s computer</, "the chat's computer tab is the owner's, not named for another bot");
   // The user's own: as always.
   const mine = { ...own(), host: "mac", sessions: [{ ...c.state.sessions[0], botId: "boppy" }] };
   assert.equal(tabsShown([mac], mine, opts(mine)).length, 1);
