@@ -2176,7 +2176,7 @@ export function Settings({
   else if (pane === "bots")
     body = (
       <>
-        <PaneHead title="Bots" sub={`${wsName}'s bots. Each has a settings page of its own.`} />
+        <PaneHead title="Bots" sub={shared ? `${wsName}'s bots. Only the owner changes their settings.` : `${wsName}'s bots. Each has a settings page of its own.`} />
         <WorkspaceBots state={state} onOpenBot={shared ? undefined : onOpenBot} />
       </>
     );
