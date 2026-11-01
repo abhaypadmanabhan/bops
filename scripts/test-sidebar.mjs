@@ -251,6 +251,15 @@ await test("Needs your attention: what a bot waits on your OK for (wherever its 
 
 /* ---------------- The main bot ---------------- */
 
+await test("A shared workspace's empty chat: its bot's role once, as the line under the name, never again as a chip beside it", () => {
+  stored.clear();
+  const shared = { projectId: "p9", name: "Acme", owner: "dana@acme.example", role: "member", wsId: "ws_main" };
+  const state = world({ shared, bots: world().bots.map((b) => (b.isMain ? { ...b, role: "Chief of Staff" } : b)) });
+  const html = render(state);
+  assert.equal(html.match(/>Chief of Staff</g)?.length, 1, "said once");
+  assert.doesNotMatch(html, /data-row-line="role"[^>]*>Chief of Staff</, "and not as the chip");
+});
+
 await test("The main bot: a two-line chat row like every bot's, pinned first, marked only by the star on its avatar", () => {
   stored.clear();
   const role = (state) => ({ ...state, bots: state.bots.map((b) => (b.isMain ? { ...b, role: "Chief of Staff" } : b)) });
