@@ -701,16 +701,36 @@ export function ChatView({
           )}
         </header>
         <div className={`flex flex-1 flex-col justify-end gap-1.5 px-5 pb-9 pt-8 ${width}`}>
-          {/* An empty chat invites the user to start it, never a viewer of a shared workspace's (it's the owner's to start). */}
-          {messages.length === 0 && !state.shared && (
-            <div className="m-auto max-w-[300px] py-10 text-center text-[14px] leading-5 text-[#6B6B6B]">
-              {solo
-                ? solo.isMain
-                  ? teamOf(state).length > 1
-                    ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
-                    : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
-                  : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
-                : "Say hi to the group. @mention a bot to point at it."}
+          {/* An empty chat invites whoever can start it (the owner, or a teammate with Write on its bot) and offers a first ask. */}
+          {messages.length === 0 && (!state.shared || (!!solo && state.shared.levels?.[solo.id] === "write")) && (
+            <div className="m-auto flex max-w-[360px] flex-col items-center gap-3 py-10 text-center">
+              {solo && <Mascot botId={solo.id} color={solo.color} size={64} live chatId={c.id} />}
+              <p className="text-[14px] leading-5 text-[#6B6B6B]">
+                {solo
+                  ? solo.isMain
+                    ? teamOf(state).length > 1
+                      ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
+                      : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
+                    : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
+                  : "Say hi to the group. @mention a bot to point at it."}
+              </p>
+              {solo && (
+                <div className="mt-1 flex w-full flex-col gap-2">
+                  {(solo.isMain ? ["What is everyone working on?", "Help me onboard a new client", "What can this team do for me?"] : ["What can you do?", "Show me your latest work", "What do you need from me?"]).map((ask) => (
+                    <button
+                      key={ask}
+                      onClick={() => {
+                        setDraft(ask);
+                        requestAnimationFrame(() => document.getElementById("composer")?.focus());
+                      }}
+                      className="flex items-center justify-between rounded-full bg-white px-4 py-2.5 text-left text-[14px] leading-5 text-ink shadow-[0_0_0_1px_#E2E2DF] transition-colors duration-100 hover:bg-[#F7F7F6] active:scale-[0.98]"
+                    >
+                      {ask}
+                      <span aria-hidden className="text-[#9A9A98]">→</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {(hiddenCount > 0 || olderThere) && (
