@@ -687,6 +687,25 @@
   animation: rise-in 240ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
 }
 
+/*
+ * A bot's reply that came in while the chat was open: all of it at once, up from a touch smaller and a soft blur,
+ * settling fast (Grok Bot's message rows: 12px, 94%, opaque by halfway, cubic-bezier(.23, 1, .32, 1)).
+ */
+@keyframes reply-in {
+  from {
+    opacity: 0;
+    filter: blur(4px);
+    transform: translateY(12px) scale(0.94);
+  }
+  55% {
+    opacity: 1;
+  }
+}
+.motion-reply-in {
+  transform-origin: left bottom;
+  animation: reply-in 320ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
+}
+
 /* What you just sent: up from the composer, a touch smaller at first. */
 @keyframes send-in {
   from {
@@ -850,6 +869,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .motion-rise-in,
+  .motion-reply-in,
   .motion-send-in,
   .motion-new-item,
   .motion-menu-in,
