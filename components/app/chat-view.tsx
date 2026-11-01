@@ -37,6 +37,7 @@ import { threadAgentWords, threadKind } from "./bot-ai";
 import { AgentChipPick, boxAgents, pickLine, useBotKeys } from "./new-thread";
 import { AskInPlace, ChatAvatar, chatName, clockTime, memberAnswers, needsYou, post, ReadOnlyLine, StatusIcon, teamOf, useNow } from "./ui";
 import { ReplyDrafts } from "./reply-drafts";
+import { dropCitations, plainStep } from "@/lib/plain-words";
 import { SkillProposals } from "./skill-proposals";
 
 /** Light markdown for bot text: **bold** and [links](url). */
@@ -90,7 +91,8 @@ const isFileLink = (href: string) => /^(\/workspace\/|~\/|\/Users\/|file:\/\/\/)
 
 export function Rich({ text, botId }: { text: string; botId?: string }) {
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
-  const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
+  // A model's citation markers are for it, not for people: they go.
+  const blocks = dropCitations(text).split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
   return (
     <LinkedBy.Provider value={botId}>
       {blocks.map((b, i) =>
@@ -443,12 +445,38 @@ export function ChatView({
 
   // Opening a chat lands on its latest message; only new messages in the open chat glide in.
   const shownChat = useRef<string | null>(null);
+  // Whether the reader is at the latest message, so the chat follows it.
+  const follow = useRef(true);
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
+    follow.current = true;
     el.scrollTo({ top: el.scrollHeight, behavior: shownChat.current === c.id && !matchMedia("(prefers-reduced-motion: reduce)").matches ? "smooth" : "instant" });
     shownChat.current = c.id;
   }, [messages.length, c.typing.length, c.id]);
+  // A reader at the bottom stays there when the column changes size (the side panel opening makes every bubble
+  // taller): they never land on old messages. One who scrolled up keeps their place. The chat only ever scrolls
+  // itself down, so moving up away from the bottom is always the reader's own.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el || typeof ResizeObserver !== "function") return;
+    let top = el.scrollTop;
+    const onScroll = () => {
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 40) follow.current = true;
+      else if (el.scrollTop < top) follow.current = false;
+      top = el.scrollTop;
+    };
+    const ro = new ResizeObserver(() => {
+      if (follow.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      ro.disconnect();
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, [c.id]);
 
   // Marked read only when there's something unread: each mark is a state change every open page reloads.
   const lastAt = messages.at(-1)?.at ?? 0;
@@ -673,16 +701,36 @@ export function ChatView({
           )}
         </header>
         <div className={`flex flex-1 flex-col justify-end gap-1.5 px-5 pb-9 pt-8 ${width}`}>
-          {/* An empty chat invites the user to start it, never a viewer of a shared workspace's (it's the owner's to start). */}
-          {messages.length === 0 && !state.shared && (
-            <div className="m-auto max-w-[300px] py-10 text-center text-[14px] leading-5 text-[#6B6B6B]">
-              {solo
-                ? solo.isMain
-                  ? teamOf(state).length > 1
-                    ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
-                    : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
-                  : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
-                : "Say hi to the group. @mention a bot to point at it."}
+          {/* An empty chat invites whoever can start it (the owner, or a teammate with Write on its bot) and offers a first ask. */}
+          {messages.length === 0 && (!state.shared || (!!solo && state.shared.levels?.[solo.id] === "write")) && (
+            <div className="m-auto flex max-w-[360px] flex-col items-center gap-3 py-10 text-center">
+              {solo && <Mascot botId={solo.id} color={solo.color} size={64} live chatId={c.id} />}
+              <p className="text-[14px] leading-5 text-[#6B6B6B]">
+                {solo
+                  ? solo.isMain
+                    ? teamOf(state).length > 1
+                      ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
+                      : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
+                    : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
+                  : "Say hi to the group. @mention a bot to point at it."}
+              </p>
+              {solo && (
+                <div className="mt-1 flex w-full flex-col gap-2">
+                  {(solo.isMain ? ["What is everyone working on?", "Help me onboard a new client", "What can this team do for me?"] : ["What can you do?", "Show me your latest work", "What do you need from me?"]).map((ask) => (
+                    <button
+                      key={ask}
+                      onClick={() => {
+                        setDraft(ask);
+                        requestAnimationFrame(() => document.getElementById("composer")?.focus());
+                      }}
+                      className="flex items-center justify-between rounded-full bg-white px-4 py-2.5 text-left text-[14px] leading-5 text-ink shadow-[0_0_0_1px_#E2E2DF] transition-colors duration-100 hover:bg-[#F7F7F6] active:scale-[0.98]"
+                    >
+                      {ask}
+                      <span aria-hidden className="text-[#9A9A98]">→</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {(hiddenCount > 0 || olderThere) && (
@@ -2522,7 +2570,7 @@ export function ThreadSheet({
           {lines.map((l, i) =>
             l.kind === "note" ? (
               <p key={i} className="text-[14px] leading-[22px] [overflow-wrap:anywhere]">
-                {l.text}
+                {dropCitations(l.text)}
               </p>
             ) : l.kind === "steps" ? (
               <div key={i} className="flex flex-col gap-1 self-start">
@@ -2534,7 +2582,7 @@ export function ThreadSheet({
                     <rect x="1.5" y="2" width="11" height="7.5" rx="1.5" fill="none" stroke="#6B6B6B" strokeWidth="1.3" />
                     <path d="M5 12h4" fill="none" stroke="#6B6B6B" strokeWidth="1.3" strokeLinecap="round" />
                   </svg>
-                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{l.steps[l.steps.length - 1].detail}</span>
+                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{plainStep(l.steps[l.steps.length - 1].detail)}</span>
                   <span className="font-mono text-[11px] leading-[14px] text-[#9A9A98]">
                     {l.steps.length} step{l.steps.length === 1 ? "" : "s"} {openSteps.includes(i) ? "‹" : "›"}
                   </span>
