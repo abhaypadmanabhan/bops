@@ -22,7 +22,10 @@ export type CloudSession = {
    */
   agentmail: {
     podId: string;
+    /** Empty for a computer's runner, which gets no key (`proxied`). */
     apiKey: string;
+    /** A computer's runner: its mail goes through /proxy/agentmail on its own credential, in its bots' inboxes only (cloud/proxy.ts). */
+    proxied?: true;
     domain?: string | null;
     /**
      * The user's own mail handle, their default workspace's part of the address (tiger in
@@ -130,16 +133,32 @@ export const STATE_PROTOCOL = 2;
  * app's calls for the user's state (but its copy before Start over) and its tunnel are refused (426
  * STATE_TOO_NEW) and its notices say to update (cloud/state.ts). 3: routines that run every so often,
  * before meetings or monthly, and a bot with no access to an app, which 0.0.28 runs over and over, runs
- * daily, or lists as able to use it.
+ * daily, or lists as able to use it. 4: routines may run on a cloud runner (a Bops on one of the bots'
+ * computers, lib/server/runner.ts); an older app runs them all again. Only an app at level 4 stops its
+ * routines on that 426 (ROUTINES_STOP_LEVEL): an older one that's still open would go on from its copy in
+ * memory, so it's refused the proxies too (cloud/state.ts behindState), and its runs fail instead of
+ * running a second time.
  */
 export const BOPS_STATE_LEVEL_HEADER = "x-bops-state-level";
-export const STATE_LEVEL = 3;
+export const STATE_LEVEL = 4;
+/** The first level whose app stops its routines when it's refused the user's state (lib/server/routines.ts tick). */
+export const ROUTINES_STOP_LEVEL = 4;
 /** 426: a Mac of the user's on a newer Bops wrote their state, which this app can't be given (BOPS_STATE_LEVEL_HEADER). */
 export const STATE_TOO_NEW = "state_too_new";
 /** 409: the call named another user than the key's. */
 export const WRONG_USER = "wrong_user";
 /** 409 on PUT /v1/state: someone else wrote since `base` (CloudStateConflict). */
 export const STATE_CONFLICT = "state_conflict";
+/**
+ * 401: the user deleted their Orgo account, and Bops Cloud deleted what it held for them
+ * (cloud/delete-user.ts): every call is turned down as signed out, and nothing of theirs is written again.
+ */
+export const ACCOUNT_DELETED = "account_deleted";
+/**
+ * 403: a computer signed in as itself (its runner, on its Orgo identity or its own key) called what only
+ * its user may (phone, mail, Slack, numbers, backups, notices, the tunnel...), or sent another device.
+ */
+export const COMPUTER_NOT_ALLOWED = "computer_not_allowed";
 
 /** GET /v1/state: the blob (no `messages`), its version (the cloud's count, bumped on every write) and the newest message write's seq. 404 when there's none yet. */
 export type CloudState = { version: number; seq: number; protocol: number; writer: string | null; state: Record<string, unknown> };
@@ -217,8 +236,11 @@ export type MacToCloud =
  *   away. Kept for a day: an older one is dropped, not answered late.
  * - "plan": the user's plan changed, or what it brings the main bot did (CloudPlanPayload): a number
  *   and an inbox the cloud set up for it, paused, or given back. The Mac takes them into its state.
+ * - "member": something a member with Write did in the owner's workspace from their own Bops
+ *   (MemberActPayload), checked by Bops Cloud and again by the Mac, which carries it out as the
+ *   member's. Kept MEMBER_ACT_MS: an older one is dropped, never done late.
  */
-export type PendingKind = "agentphone" | "call" | "slack" | "plan";
+export type PendingKind = "agentphone" | "call" | "slack" | "plan" | "member";
 
 /** A number the cloud holds for a plan, as the Mac keeps it on the bot (Bot.phone, Bot.phoneLine). */
 export type PlanPhone = { number: string; numberId: string; agentId: string; status: PlanItemStatus; problem?: string };
@@ -529,3 +551,224 @@ export type CloudUsage = {
   /** Per bot (null: not tied to one bot): model tokens, call seconds, and cost. */
   bots: { botId: string | null; tokens: number; callSeconds: number; costMicros: number }[];
 };
+
+/**
+ * Live (cloud/live.ts): what each bot of a workspace is doing right now, and a nudge when the
+ * workspace changed, streamed to every signed-in device that watches it. Nothing of it is saved.
+ *
+ * GET /v1/live?ws=<workspace id> is a stream of Server-Sent Events. Each one's `event:` is its type and
+ * its `data:` is JSON. A new connection first gets a "snapshot" (every bot that isn't idle), then the
+ * events it missed since its Last-Event-ID, or a "reset" when they can't be told (too long away, or
+ * the cloud restarted): it reads the state afresh then. POST /v1/live { ws, events } publishes.
+ *
+ * A member of a shared workspace watches GET /v1/live?project=<Orgo project id> (cloud/members.ts): the
+ * owner's stream for that workspace, carrying only what's of the bots they see. Member streams never
+ * publish; a Write member acts through POST /v1/ws/<id>/act. It ends with a
+ * "revoked" event (no data) once orgo-web no longer says they're a member: the app drops its copy of the
+ * workspace and leaves it.
+ */
+export type LiveMood = "thinking" | "writing" | "speaking" | "working" | "idle";
+export const LIVE_MOODS: readonly LiveMood[] = ["thinking", "writing", "speaking", "working", "idle"];
+/** How a routine changed, for its "routine" event. */
+export type LiveRoutineChange = "added" | "changed" | "removed" | "run-started" | "run-finished";
+export const LIVE_ROUTINE_CHANGES: readonly LiveRoutineChange[] = ["added", "changed", "removed", "run-started", "run-finished"];
+/** Seconds a mood lasts unless it's said again (its publisher says it every 5 seconds while it holds). */
+export const LIVE_MOOD_TTL = 15;
+
+/** What a device publishes (POST /v1/live). */
+export type LiveEventIn =
+  /** A bot's mood. `chatId`: where it's typing, when it is. Idle ends it. */
+  | { type: "mood"; botId: string; chatId?: string; mood: LiveMood; ttl?: number }
+  /** A thread this device runs: its status and what it's doing in a word or two. */
+  | { type: "session"; id: string; botId: string; status: string; activity?: string }
+  | { type: "routine"; id: string; change: LiveRoutineChange }
+  | { type: "call"; botId: string; on: boolean };
+export type LivePublish = { ws: string; events: LiveEventIn[] };
+
+/**
+ * What a stream carries. `by` is the device that published it (BOPS_DEVICE_HEADER; "cloud" for the
+ * cloud's own), so a device can leave out its own. "state": the workspace's part of the state changed
+ * (`hash`, a fingerprint of what this stream's viewer is shown of it, SharedWsState.hash: the owner's
+ * view on the owner's streams, each member's own on theirs) or messages were written (`seq`; on a
+ * member's stream, only in a chat they see): read it now.
+ */
+export type LiveEventOut =
+  | (LiveEventIn & { by: string; at: number })
+  | { type: "state"; hash?: string; seq?: number; by: string; at: number };
+export type LiveSnapshot = { moods: { botId: string; chatId?: string; mood: LiveMood; ttl: number; by: string }[] };
+
+/**
+ * Shared workspaces (cloud/members.ts): someone the owner added to a Bops workspace's Orgo project
+ * watches it from their own Bops: Read watches; Write also acts (POST /v1/ws/<id>/act, MemberAct). Who
+ * may is orgo-web's to say, with the caller's own key: GET <orgo>/api/projects/<id>/bops-role answers
+ * WsAccess for the owner and each member (404 for anyone else). Orgo's role says only who gets in: what
+ * each may do with a bot is the level the owner gave them in Bops, whatever the role. Of the workspace, anyone
+ * but the owner sees only the bots the owner gave them (cloud/member-access.ts, kept on the workspace in
+ * the owner's state as memberAccess, which is never shown to them), and everything of each: its chats
+ * with the owner's own messages (one kept "between us" too: that mark only keeps things out of the
+ * shared memory), its threads, routines and watches. A group chat only when every bot in it is theirs.
+ */
+export type WsRole = "owner" | "admin" | "member";
+export const WS_ROLES: readonly WsRole[] = ["owner", "admin", "member"];
+/** `joinedAt`: when the caller's membership began, from an orgo-web that says it (member-access.ts currentFor). */
+export type WsAccess = { role: WsRole; ownerUserId: string; bopsWsId: string | null; name: string; joinedAt?: number };
+/** The code a project with no Bops workspace of its own is refused with (one "bops" project would show every workspace). */
+export const WS_NOT_SHAREABLE = "not_shareable";
+
+/**
+ * GET /v1/ws/<projectId>/state: what a member is shown of the owner's workspace (cloud/ws-slice.ts: the
+ * bots they were given, an allow list of fields), and its chats' newest messages (MESSAGES_PER_CHAT
+ * each, oldest first; `more` names the chats that have older ones, read with ?chat=<id>&before=<at>&beforeId=<id>:
+ * the page before the oldest message the reader has, its time and id).
+ * `hash` is the slice's fingerprint, as the stream's "state" events carry it; `seq` the newest message
+ * write in its chats. With ?have=<hash>.<seq> and nothing changed since, only { hash, seq, unchanged: true }.
+ */
+export type SharedWsSlice = {
+  workspace: Record<string, unknown> | null;
+  bots: Record<string, unknown>[];
+  chats: Record<string, unknown>[];
+  sessions: Record<string, unknown>[];
+  routines: Record<string, unknown>[];
+  watches: Record<string, unknown>[];
+  /**
+   * What its bots wait on the owner's OK for (lib/types.ts AppApproval): answered by the owner, or by a member
+   * with Write on its bot (act); none when nothing waits, or from a Bops Cloud before asks were shared.
+   */
+  approvals?: Record<string, unknown>[];
+  /** For anyone but the owner: their level for each bot shown ("read" or "write"). None for the owner (every bot is theirs). */
+  levels?: Record<string, "read" | "write">;
+  /**
+   * The workspace's apps on the web, for someone given Your Apps at Read or more (cloud/ws-slice.ts appsFor), as the owner's
+   * Mac last read them. None for the owner (their own page reads them), for anyone else without Read, and from a Bops
+   * Cloud before the scope.
+   */
+  apps?: SharedApps;
+  /**
+   * The computers its bots work on with two or more of the bots shown on one (cloud/ws-slice.ts computersOf): each by a
+   * key of its own (never the computer's id), its bots shown, the name the owner gave it (Workspace.computerNames), and
+   * its bot when that's one shown. None when there's no such computer, and from a Bops Cloud before groups.
+   */
+  groups?: SharedGroup[];
+  /** The site each bot shown works on (lib/types.ts BotSite, Workspace.botSites): only with `apps`, by bot id. */
+  sites?: Record<string, { app: string; site: string }>;
+};
+/** One computer's bots shown (SharedWsSlice.groups; lib/bot-groups.ts SharedGroup, spelled out). */
+export type SharedGroup = { key: string; bots: string[]; name?: string; host?: string };
+
+/** What a member with Your Apps sees of a workspace's apps (SharedWsSlice.apps): `at` when the owner's Mac last read them. */
+export type SharedApps = { level: "read" | "write"; at: number; list: SharedApp[]; /** The workspace's domains bought through Orgo: Write only. */ owned?: { id: string; domain: string }[] };
+/** One app as a member sees it (lib/hosted-apps.ts AppForMembers, spelled out: this file imports nothing). */
+export type SharedApp = {
+  name: string;
+  /** Its other sites' names (its own is named as the app). */
+  siteNames?: string[];
+  /** Its bot, when it's one they see. */
+  botId?: string;
+  url?: string;
+  /** Its computer went: it needs a new home (a deploy gives it one). */
+  lost?: true;
+  head?: { id: string; message: string; at: number } | null;
+  /**
+   * `url`: Published's address (none: no domain yet). Its Preview, where members deploy, from an owner's Bops that sends
+   * it: its link, newest deploy and what it serves, whether its link asks for a password, and the password at Write only.
+   */
+  sites?: {
+    name: string;
+    url: string | null;
+    preview?: string | null;
+    previewLive?: { id: string; state: string | null; when: number | null } | null;
+    previewServing?: string | null;
+    previewProtected?: true;
+    previewPassword?: string;
+    serving: string | null;
+    live: { id: string; state: string | null; when: number | null } | null;
+    domains?: { domain: string; status: string }[];
+  }[];
+  commits?: { id: string; message: string; author: string; at: number; changes: { added: number; modified: number; deleted: number } }[];
+  /** `env`: where it went (none: from an owner's Bops before Preview, Published's). Members go back on the Preview only. */
+  deploys?: { id: string; state: string; at: string | null; rollback: boolean; when: number | null; live: boolean; canRollback: boolean; site: string; env?: "preview" | "prod" }[];
+  /** Each site's settings: Write only. */
+  settings?: Record<string, { port: number | null; install: string | null; build: string | null; start: string | null; health?: string }>;
+  acts?: { key: string; userId: string; name: string; act: "deploy" | "rollback" | "settings" | "domain"; site?: string; domain?: string; ok: boolean; said?: string; at: number }[];
+};
+export type SharedWsState = {
+  projectId: string;
+  wsId: string;
+  role: WsRole;
+  name: string;
+  hash: string;
+  seq: number;
+  state: SharedWsSlice;
+  messages: Record<string, unknown>[];
+  more: string[];
+  /** The caller's Orgo user id: the window tells its own words (Message.member) from other members' with it. */
+  you?: string;
+  /**
+   * Read again over a copy (?have=): the messages of these chats the owner deleted since the copy's seq, by id
+   * (the newest MAX_GONE), so it drops them from the older pages it read too ("Show earlier messages"). Unset
+   * from a Bops Cloud from before.
+   */
+  gone?: string[];
+};
+/** The most deleted ids a read again says (SharedWsState.gone). */
+export const MAX_GONE = 2000;
+export type SharedWsUnchanged = { hash: string; seq: number; unchanged: true };
+export const MESSAGES_PER_CHAT = 200;
+
+/**
+ * What a member with Write does in the owner's workspace (POST /v1/ws/<projectId>/act, cloud/members.ts),
+ * from their own Bops: say something in a chat (a bot's 1:1 chat, or a group with every bot at Write),
+ * reply in a thread, answer an ask (Allow once, Always allow, Deny with a note), stop threads, say
+ * there's nothing to add, or Compact a chat or a thread (as saying something there takes). Ids are the
+ * owner's, as the member's copy has them.
+ */
+export type MemberAct =
+  | { act: "chat"; chatId: string; text: string; replyTo?: string }
+  | { act: "reply"; sessionId: string; text: string }
+  | { act: "compact"; chatId: string }
+  | { act: "compact"; sessionId: string }
+  | { act: "answer"; askId: string; reply: "once" | "always" | "reject"; message?: string }
+  | { act: "stop"; sessionIds: string[] }
+  | { act: "dismiss"; sessionId: string }
+  // Your Apps at Write (SharedWsSlice.apps): done by the owner's Mac, named as the member (lib/server/member-acts.ts).
+  | MemberAppAct;
+/** What a member with Your Apps at Write does to an app: deploy (the newest changeset, or `at`), go back to an earlier deploy, change a site's settings, or use one of the workspace's own domains (`zone`, its id). */
+export type MemberAppAct =
+  | { act: "deploy"; app: string; site?: string; at?: string }
+  | { act: "rollback"; app: string; deployment: string; site?: string }
+  | { act: "settings"; app: string; site?: string; port?: number; install?: string; build?: string; start?: string; health?: string }
+  | { act: "domain"; app: string; site?: string; zone: string; subdomain?: string };
+export const isAppAct = (a: { act: string }): a is MemberAppAct => a.act === "deploy" || a.act === "rollback" || a.act === "settings" || a.act === "domain";
+/** 403: the apps are shown to the caller at Read (Your Apps), not Write. */
+export const MEMBER_APPS_READ_ONLY = "member_apps_read_only";
+/** `key`: the member's own id for this act (8 to 64 of A-Z a-z 0-9 _ -): sent again on a retry, it's never done twice. */
+export type MemberActBody = { key: string; act: MemberAct };
+/**
+ * What waits for the owner's Mac (a "member" event). `wsId` is the owner's real workspace id; `member` who
+ * did it, as Bops Cloud vouched for them (cloud/member-access.ts MemberWho); `joinedAt` when their
+ * membership began, as orgo-web said it (member-access.ts currentFor).
+ */
+export type MemberActPayload = { projectId: string; wsId: string; member: { userId: string; email?: string; name: string }; joinedAt?: number; key: string; at: number; act: MemberAct };
+/** 202. `macOn`: the owner's Bops is connected now (false: it waits up to MEMBER_ACT_MS for it). */
+export type MemberActAnswer = { ok: true; macOn: boolean };
+/** 403: a bot the act touches is at Read for the caller (or a group has one that is). */
+export const MEMBER_READ_ONLY = "member_read_only";
+/**
+ * 403: only the owner does this, whatever a member's level: telling a thread on the owner's Mac something (or saying
+ * there's nothing to add, or answering its asks), or answering an ask to use the owner's Connected apps or API keys
+ * (member-access.ts ownerOnlyAsk).
+ */
+export const MEMBER_OWNER_ONLY = "member_owner_only";
+/** 409: the ask is answered, or the thread already ended (stop, dismiss). */
+export const NOT_WAITING = "not_waiting";
+/** 403: the caller is the workspace's owner, who acts in their own Bops. */
+export const OWN_WORKSPACE = "own_workspace";
+/** How many acts one member may send a minute, across every workspace shared with them. */
+export const MEMBER_ACTS_A_MINUTE = 30;
+/** The most a member's message or reply may say, and a note with Deny. */
+export const MEMBER_MAX_TEXT = 8000;
+export const MEMBER_MAX_NOTE = 2000;
+/** The most threads one Stop may name ("Stop all"). */
+export const MEMBER_STOP_MAX = 20;
+/** How long an act waits for the owner's Bops to open: an older one is dropped, never done late. */
+export const MEMBER_ACT_MS = 10 * 60_000;

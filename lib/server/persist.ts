@@ -2,7 +2,7 @@ import "server-only";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { AppState } from "@/lib/types";
+import type { AppState, Message, Session } from "@/lib/types";
 import { legacyStateFile, moveLegacyState, userDataDir } from "./user-paths";
 
 /**
@@ -47,7 +47,24 @@ export type Persistence = {
   unsent(): boolean;
   /** Read what changed elsewhere (another Mac of the user's) now. */
   pull(): Promise<void>;
+  /** When what changed elsewhere was last read in full (0: never; a store with no elsewhere, never). */
+  pulledAt(): number;
+  /** This server as the user's state knows it (state.macs, Session.by), or null for a store that's only ever this one's. */
+  device(): string | null;
+  /** A newer Bops of the user's wrote their state, which this one can't be given (426 STATE_TOO_NEW): its routines and beats stop until it's updated. */
+  tooNew(): boolean;
+  /** The state as Bops Cloud has it, as this server last wrote or read it (the Mac app's and a runner's store); none for a store that's only ever this one's. */
+  cloudCopy?(): Record<string, unknown> | null;
+  /**
+   * Whether Bops Cloud, as this server last saved to it, holds none of these messages (gone from the state
+   * here): their removal is up, or they never were. None for a store that's only ever this one's, whose flush
+   * says it.
+   */
+  removedUp?(ids: readonly string[]): boolean;
 };
+
+/** What another Mac's changes, merged in here, took out of the state in memory: it deleted them there. */
+export type Went = { messages: Message[]; sessions: Session[] };
 
 /** What a backend needs from the store: the state, a way to swap in one loaded from elsewhere, and to say it changed. */
 export type StateAccess = {
@@ -56,6 +73,8 @@ export type StateAccess = {
   replace(raw: Record<string, unknown> | null): void;
   /** The state in memory changed in place (another Mac's changes merged in): the app polls it again. Not a new epoch. */
   touch(): void;
+  /** What those changes took out of it (Went), told after touch: what this Mac keeps beside them can go too (store.ts watchGone). */
+  went?(gone: Went): void;
 };
 
 /** A sign-in's state couldn't be loaded (Bops Cloud down, or this Mac offline): the sign-in is refused, and the app says so. */
@@ -64,6 +83,46 @@ export class StateLoadError extends Error {}
 export const onPostgres = () => !!process.env.BOPS_DATABASE_URL;
 /** Self-hosting: keys in .env.local, no Bops Cloud, the state in files on this Mac. */
 export const selfHosted = () => process.env.BOPS_SELF_HOSTED === "1";
+/** A computer's Bops runner (BOPS_RUNNER=1, lib/server/runner.ts): the server on one of the bots' computers that runs its routines while the user's Mac is closed. */
+export const onRunner = () => process.env.BOPS_RUNNER === "1";
+
+/**
+ * What runs by itself in Bops (a timer, a listener, a look that starts on import or from the state
+ * route). On a computer's runner only RUNNER_LOOPS do: the routines timer, the mirror of its own
+ * routines to Orgo, the threads it started, and saying its computer is in use while one runs. The rest
+ * is the Mac's (MAC_LOOPS): the bots' watches, the digest, the access set and the map sent to Orgo
+ * (access-sync.ts, bops-sync.ts), email, texts and calls, Telegram, Discord and Slack, the look at the
+ * bots' computers, routing through home internet, the Mac's zone, Codex on the Mac, the free computer
+ * found again, the cloud tunnel (one per user: a runner's would take the Mac's), the live stream (Bops
+ * Cloud's /v1/live is for devices, not computers: live.ts), the Mac's own check, memory sorting and
+ * Orbit, setting up runners, and the Keep chats and calls sweep (privacy.ts: it deletes for every Mac, and
+ * prunes this Mac's own files).
+ */
+export const RUNNER_LOOPS = ["routines", "routine-sync", "sessions", "in-use"] as const;
+export const MAC_LOOPS = [
+  "watches",
+  "digest",
+  "access-sync",
+  "bops-sync",
+  "mail",
+  "phone",
+  "channels",
+  "computer-checks",
+  "relay",
+  "zone",
+  "codex",
+  "free-computer",
+  "tunnel",
+  "live",
+  "mac-check",
+  "categories",
+  "orbit",
+  "runner-install",
+  "privacy",
+] as const;
+export type Loop = (typeof RUNNER_LOOPS)[number] | (typeof MAC_LOOPS)[number];
+/** Whether `loop` runs on this server: everywhere but a runner, where only RUNNER_LOOPS do. */
+export const loopHere = (loop: Loop) => !onRunner() || (RUNNER_LOOPS as readonly string[]).includes(loop);
 
 const gx = globalThis as unknown as { __bopsExitWork?: Map<string, () => Promise<unknown>>; __bopsExitHooked?: boolean; __bopsStopping?: boolean };
 const exitWork = (gx.__bopsExitWork ??= new Map());
@@ -200,5 +259,8 @@ export function fileStore({ get, replace }: StateAccess): Persistence {
     flush: (ms) => Promise.race([flush().then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref?.())]),
     unsent: () => !!save.timer || !!save.writing,
     pull: async () => {},
+    pulledAt: () => 0,
+    device: () => null,
+    tooNew: () => false,
   };
 }

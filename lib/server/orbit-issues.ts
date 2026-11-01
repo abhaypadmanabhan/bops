@@ -8,7 +8,7 @@ import { isIssueId, MAX_ISSUE_TAGS, PRIORITY_IDS, priorityLabel, STATUS_IDS, sta
 import { tagsOf } from "@/lib/routine-catalog";
 import { bankClient, memoryOn, sessionRef } from "./memory";
 import { categoriesOn, snapshot } from "./memory-categories";
-import { orbitCall, orbitProject } from "./orbit-sync";
+import { orbitCall, orbitChanged, orbitProject } from "./orbit-sync";
 import { cleanText } from "./routine-sync";
 import { bot, getState, ownerName, sameState, userDir } from "./store";
 
@@ -47,10 +47,12 @@ const nameOf = (by: IssueBy) => (by.botId ? (bot(by.botId)?.name ?? "A bot") : o
  * session) still to delete.
  */
 type Cache = { at: number; issues: Issue[]; dirty?: string[]; gone?: string[]; deletes?: { orgoId: string; id: string }[] };
-type Live = { lists: Map<string, { file: string | null; cache: Cache }>; queues: Map<string, Promise<unknown>>; joined: Set<string>; backfilled?: Set<string> };
+/** `dropped`: workspaces deleted here (dropWorkspaceIssues): their cache is never written again. */
+type Live = { lists: Map<string, { file: string | null; cache: Cache }>; queues: Map<string, Promise<unknown>>; joined: Set<string>; backfilled?: Set<string>; dropped?: Set<string> };
 const g = globalThis as unknown as { bopsIssues?: Live };
 const live: Live = (g.bopsIssues ??= { lists: new Map(), queues: new Map(), joined: new Set() });
 live.backfilled ??= new Set();
+live.dropped ??= new Set();
 
 const fileOf = (ws: string) => {
   const dir = userDir();
@@ -83,7 +85,7 @@ function cacheOf(ws: string): Cache {
 }
 
 function saveCache(ws: string, cache: Cache, ours: () => boolean) {
-  if (!ours()) return;
+  if (!ours() || live.dropped!.has(ws)) return;
   live.lists.set(ws, { file: fileOf(ws), cache });
   const file = fileOf(ws);
   if (!file) return;
@@ -177,6 +179,9 @@ function urlOf(u: unknown) {
   }
 }
 
+/** An account's id as Bops keeps one (AppAccount.id: Composio's "ca_…"), or nothing. */
+const accountIdOf = (v: unknown) => (typeof v === "string" && /^[A-Za-z0-9_:.-]{1,120}$/.test(v) ? v : undefined);
+
 /** Who it's for, and their item in Orbit (a person or a company there by that name). */
 function customerOf(ws: string, name: unknown): Issue["customer"] {
   const n = plain(name, 120);
@@ -213,6 +218,7 @@ function issueOf(ws: string, s: { id: string; metadata?: Record<string, unknown>
     ...(str(m.sourceApp) ? { sourceApp: str(m.sourceApp) } : {}),
     ...(str(m.externalId) ? { externalId: str(m.externalId) } : {}),
     ...(str(m.url) ? { url: str(m.url) } : {}),
+    ...(accountIdOf(m.accountId) ? { accountId: accountIdOf(m.accountId) } : {}),
     ...(customer && typeof customer.name === "string" ? { customer: { name: customer.name, ...(typeof customer.itemKey === "string" ? { itemKey: customer.itemKey } : {}) } } : {}),
     ...(str(m.botId) ? { botId: str(m.botId) } : {}),
     ...(str(m.routineId) ? { routineId: str(m.routineId) } : {}),
@@ -256,7 +262,8 @@ async function sessionOf(ws: string, id: string) {
 /** A line of history in the session, said by whoever did it (their peer is never observed). */
 async function say(ws: string, session: HonchoSession, by: IssueBy, kind: IssueEvent["kind"], line: string) {
   const x = bankOrThrow(ws);
-  const who = by.botId ?? "owner";
+  // The bot that did it, else the owner (undefined: the bank's own peer).
+  const who = by.botId;
   const peerId = x.peerId(who);
   const key = `${x.bank}/${session.id}/${peerId}`;
   if (!live.joined.has(key)) {
@@ -285,6 +292,15 @@ type Answer = Awaited<ReturnType<typeof orbitCall>>;
 type Reply = { status: number; json: Record<string, unknown> };
 const ok = (r: Answer): r is { status: number; json: Record<string, unknown> } => !!r && r !== "off" && r.status < 300;
 const retryable = (r: Answer) => r === null || (r !== "off" && r.status >= 500);
+/**
+ * A delete Orgo didn't take that it may take later: no answer, the key signed out (401) or not allowed for
+ * now (403), a timeout (408), too many asks (429), 5xx. Kept in `deletes` and sent again, as orbit-sync's
+ * forget is (workspace-skills.ts forNow is the same set), without holding up the others. Any other answer
+ * ends it: done (2xx; 404 and 410, the row is gone) or one Orgo never takes (400, 405, 409, 413, 422).
+ */
+const deleteAgain = (r: Answer) => r === null || (r !== "off" && (r.status >= 500 || r.status === 401 || r.status === 403 || r.status === 408 || r.status === 429));
+/** How many issues Orgo lists at most (orgo-web's GET …/orbit/issues, newest change first). */
+const LIST_MAX = 200;
 /** The workspace's issues are Orgo's (its project has the routes, as far as is known). */
 const onOrgo = (ws: string) => !!orbitProject(ws);
 const s = (v: unknown, max: number) => (typeof v === "string" && v ? cleanText(v, max) : null);
@@ -341,6 +357,7 @@ function fromRow(ws: string, r: unknown, prev?: Issue): Issue | null {
     updatedAt: msOf(x.updatedAt) ?? prev?.updatedAt ?? 0,
     ...(msOf(x.closedAt) ? { closedAt: msOf(x.closedAt) } : {}),
     ...(prev?.lastMessageAt ? { lastMessageAt: prev.lastMessageAt } : {}),
+    ...(prev?.accountId ? { accountId: prev.accountId } : {}),
   };
 }
 
@@ -356,12 +373,21 @@ function overlay(ws: string, was: Issue): Issue {
   return out;
 }
 
-/** The Orgo id of an issue by its session (looked up in its newest 200), or null. */
-async function findOrgoId(ws: string, id: string): Promise<string | null> {
-  const r = await orbitCall(ws, "GET", "/issues?limit=200");
+/**
+ * The issue's Orgo id by its session, from Orgo's list: null when Orgo surely hasn't it (the whole list is
+ * under LIST_MAX), undefined when Orgo didn't answer (or for now), or when it can't tell: the newest
+ * LIST_MAX are all there is to ask for and it isn't among them (an older issue). It asks by
+ * `?honchoSessionId=` too, which an orgo-web that has that filter answers with that row alone (the orgo-web
+ * gap list); one without it ignores it.
+ */
+async function findOrgoId(ws: string, id: string): Promise<string | null | undefined> {
+  const r = await orbitCall(ws, "GET", `/issues?limit=${LIST_MAX}&honchoSessionId=${encodeURIComponent(id)}`);
+  if (r !== "off" && !ok(r) && deleteAgain(r)) return undefined;
   if (!ok(r) || !Array.isArray(r.json.issues)) return null;
-  const row = (r.json.issues as Record<string, unknown>[]).find((x) => x?.honchoSessionId === id);
-  return typeof row?.id === "string" ? row.id : null;
+  const list = r.json.issues as Record<string, unknown>[];
+  const row = list.find((x) => x?.honchoSessionId === id);
+  if (typeof row?.id === "string") return row.id;
+  return list.length >= LIST_MAX ? undefined : null;
 }
 
 /**
@@ -482,6 +508,7 @@ export function openIssue(ws: string, input: IssueOpen, by: IssueBy = {}): Promi
     const priority = PRIORITY_IDS.includes(input.priority as IssuePriority) ? (input.priority as IssuePriority) : undefined;
     const url = urlOf(input.url);
     const customer = customerOf(ws, input.customer);
+    const accountId = accountIdOf(input.accountId);
     const orgo = onOrgo(ws);
     const update = async (had: HonchoSession, was: Issue) => {
       // Something new on the thread (a newer message than the issue last saw, or a bot that doesn't say
@@ -497,6 +524,7 @@ export function openIssue(ws: string, input: IssueOpen, by: IssueBy = {}): Promi
         ...(priority ? { priority } : {}),
         ...(url ? { url } : {}),
         ...(customer ? { customer } : {}),
+        ...(accountId ? { accountId } : {}),
         ...(last && fresh ? { lastMessageAt: last } : {}),
         status: fresh ? (status ?? (was.status === "done" ? "open" : was.status)) : was.status,
         updatedAt: now,
@@ -510,7 +538,7 @@ export function openIssue(ws: string, input: IssueOpen, by: IssueBy = {}): Promi
       if (input.note) lines.push(["note", text(input.note, 2000)]);
       const same = (k: keyof Issue) => JSON.stringify(next[k]) === JSON.stringify(was[k]);
       // Nothing changed: nothing written, no line in its history.
-      if (!lines.length && (["tags", "priority", "url", "customer", "lastMessageAt"] as const).every(same)) return { issue: was, created: false };
+      if (!lines.length && (["tags", "priority", "url", "customer", "lastMessageAt", "accountId"] as const).every(same)) return { issue: was, created: false };
       if (orgo) next = absorb(ws, await orbitCall(ws, "POST", "/issues", rowOf(next, x.bank, by, input.note ? text(input.note, 2000) : undefined)), next, ours);
       await had.setMetadata(metadataOf(next));
       for (const [kind, line] of lines) await say(ws, had, by, kind, line);
@@ -535,6 +563,7 @@ export function openIssue(ws: string, input: IssueOpen, by: IssueBy = {}): Promi
       ...(input.lastMessageAt && Number.isFinite(input.lastMessageAt) ? { lastMessageAt: input.lastMessageAt } : {}),
       ...(url ? { url } : {}),
       ...(customer ? { customer } : {}),
+      ...(accountId ? { accountId } : {}),
       ...(by.botId ? { botId: by.botId } : {}),
       ...(by.routineId ? { routineId: by.routineId } : {}),
       openedAt: now,
@@ -613,6 +642,9 @@ export function updateIssue(ws: string, id: string, patch: IssuePatch, by: Issue
     if (note) lines.push(["note", note]);
     const draft = text(patch.draft, 4000);
     if (draft) lines.push(["reply", `Reply drafted: ${draft}`]);
+    // A reply the user sent from the issue's page (issue-source.ts): in its history as theirs, and in Orgo's as a note.
+    const replied = text(patch.replied, 4000);
+    if (replied) lines.push(["reply", `Replied: ${replied}`]);
     if (!lines.length) return { ...was, history: await historyOf(session) };
     next.updatedAt = Date.now();
     if (onOrgo(ws)) {
@@ -625,10 +657,12 @@ export function updateIssue(ws: string, id: string, patch: IssuePatch, by: Issue
             ...(next.priority !== was.priority ? { priority: next.priority } : {}),
             ...(next.tags.join(",") !== was.tags.join(",") ? { tags: next.tags } : {}),
             ...(note ? { note } : {}),
-            ...(draft ? { events: [{ kind: "reply_drafted", text: cleanText(draft, 2000) }] } : {}),
+            ...(draft || replied
+              ? { events: [...(draft ? [{ kind: "reply_drafted", text: cleanText(draft, 2000) }] : []), ...(replied ? [{ kind: "note", text: cleanText(`Replied: ${replied}`, 2000) }] : [])] }
+              : {}),
             ...(actor ? { actor: actor.slice(0, 128) } : {}),
           })
-        : await orbitCall(ws, "POST", "/issues", rowOf(next, x.bank, by, note || undefined));
+        : await orbitCall(ws, "POST", "/issues", rowOf(next, x.bank, by, note || (replied ? `Replied: ${replied}` : undefined)));
       // Deleted there (on another Mac): gone here too.
       if (orgoId && r && r !== "off" && r.status === 404) {
         cacheMark(ws, ours, (c) => (c.gone = [...new Set([...(c.gone ?? []), id])]));
@@ -646,8 +680,10 @@ export function updateIssue(ws: string, id: string, patch: IssuePatch, by: Issue
 
 /**
  * Delete an issue: its session in memory, with its history. With Orgo, its row first, and the session only
- * when Orgo says nothing else uses it; Orgo not answering, the row and then the session go at the next
- * sync. False when it isn't one of this workspace's.
+ * when Orgo says nothing else uses it; Orgo not answering or not taking it for now (401, 403, 408, 429, 5xx:
+ * deleteAgain), or not saying whether it has the row (an issue older than the newest 200 it lists), the row
+ * and then the session go at the next sync (soon, and after a backoff until Orgo takes it). False when it
+ * isn't one of this workspace's.
  */
 export function deleteIssue(ws: string, id: string): Promise<boolean> {
   bankOrThrow(ws);
@@ -655,13 +691,25 @@ export function deleteIssue(ws: string, id: string): Promise<boolean> {
     const ours = sameState();
     if (onOrgo(ws) && isIssueId(id) && !isGone(ws, id)) {
       const orgoId = cacheOf(ws).issues.find((i) => i.id === id)?.orgoId ?? (await findOrgoId(ws, id));
+      if (orgoId === undefined) {
+        // Orgo didn't say whether it has the row: gone here now, and the row (then the session) at the next sync.
+        cacheMark(ws, ours, (c) => {
+          c.gone = [...new Set([...(c.gone ?? []), id])];
+          c.deletes = [...(c.deletes ?? []).filter((d) => d.id !== id), { orgoId: "", id }];
+        });
+        cachePut(ws, null, id, ours);
+        // Sent with the next sync, soon, and again after a backoff until Orgo takes it.
+        orbitChanged(ws);
+        return true;
+      }
       if (orgoId) {
         const r = await orbitCall(ws, "DELETE", `/issues/${encodeURIComponent(orgoId)}`);
         if (r !== "off") {
           cacheMark(ws, ours, (c) => {
             c.gone = [...new Set([...(c.gone ?? []), id])];
-            if (retryable(r)) c.deletes = [...(c.deletes ?? []).filter((d) => d.id !== id), { orgoId, id }];
+            if (deleteAgain(r)) c.deletes = [...(c.deletes ?? []).filter((d) => d.id !== id), { orgoId, id }];
           });
+          if (deleteAgain(r)) orbitChanged(ws);
           cachePut(ws, null, id, ours);
           // Deleted there already (404: on another Mac, which saw to the session).
           if (ok(r)) await afterDelete(ws, id, r.json);
@@ -728,10 +776,31 @@ export function orbitIssuesFlush(ws: string): Promise<"ok" | "retry" | "off"> {
   return queued(ws, async () => {
     const ours = sameState();
     const x = bankOrThrow(ws);
+    // A delete Orgo doesn't take for now stays for the next sync; the other deletes and the changes still go.
+    let kept = false;
     for (const d of [...(cacheOf(ws).deletes ?? [])]) {
-      const r = await orbitCall(ws, "DELETE", `/issues/${encodeURIComponent(d.orgoId)}`);
+      // Deleted while Orgo didn't answer the list (or couldn't say, an older issue): its row is looked up now.
+      const orgoId = d.orgoId || (await findOrgoId(ws, d.id));
+      if (orgoId === undefined) {
+        kept = true;
+        continue;
+      }
+      if (!orgoId) {
+        // Orgo hasn't a row for it: only its session goes.
+        const found = await sessionOf(ws, d.id);
+        if (found) {
+          await sessionRef(x.client, d.id).delete();
+          x.forget(d.id);
+        }
+        cacheMark(ws, ours, (c) => (c.deletes = (c.deletes ?? []).filter((y) => y.id !== d.id)));
+        continue;
+      }
+      const r = await orbitCall(ws, "DELETE", `/issues/${encodeURIComponent(orgoId)}`);
       if (r === "off") return "off";
-      if (retryable(r)) return "retry";
+      if (deleteAgain(r)) {
+        kept = true;
+        continue;
+      }
       if (ok(r)) await afterDelete(ws, d.id, r.json);
       cacheMark(ws, ours, (c) => (c.deletes = (c.deletes ?? []).filter((y) => y.id !== d.id)));
     }
@@ -758,6 +827,51 @@ export function orbitIssuesFlush(ws: string): Promise<"ok" | "retry" | "off"> {
       cacheMark(ws, ours, (c) => (c.dirty = (c.dirty ?? []).filter((y) => y !== id)));
       cachePut(ws, next, id, ours);
     }
-    return "ok";
+    return kept ? "retry" : "ok";
   });
+}
+
+/* ---------------- A deleted workspace ---------------- */
+
+/**
+ * The sessions in memory of a workspace's issues, for its delete (memory-deletes.ts): the cache's and
+ * memory's list of them, asked while the workspace is still listed (its bank is read from it). Memory not
+ * answering within `ms` leaves the cache's.
+ */
+export async function issueSessionsOf(ws: string, ms = 10_000): Promise<string[]> {
+  const ids = new Set(cacheOf(ws).issues.map((i) => i.id).filter(isIssueId));
+  if (issuesOn())
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<null>((r) => (timer = setTimeout(() => r(null), ms)));
+      const found = await Promise.race([findSessions(ws), late]).finally(() => clearTimeout(timer));
+      if (!found) console.warn(`[issues] ${ws}: memory didn't list its issues for the delete in time`);
+      for (const s of found ?? []) if (isIssueId(s.id)) ids.add(s.id);
+    } catch (e) {
+      console.warn(`[issues] ${ws}: listing its issues for the delete: ${(e as Error).message}`);
+    }
+  return [...ids];
+}
+
+/**
+ * The titles of a workspace's issues for its delete's confirm: as listIssues has them now, or the cache's
+ * when Orgo and memory don't answer within `ms`. None with memory off.
+ */
+export async function issueTitlesOf(ws: string, ms = 8000): Promise<string[]> {
+  if (!issuesOn()) return [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((r) => (timer = setTimeout(() => r(null), ms)));
+  const r = await Promise.race([listIssues(ws).catch(() => null), late]).finally(() => clearTimeout(timer));
+  const issues = r?.issues ?? cacheOf(ws).issues.filter((i) => !cacheOf(ws).gone?.includes(i.id));
+  return issues.map((i) => i.title.trim() || "Issue");
+}
+
+/** A deleted workspace's issues go from this Mac: its cache (orbit-issues/ws-<id>.json), and nothing writes it again. */
+export function dropWorkspaceIssues(ws: string) {
+  live.dropped!.add(ws);
+  live.lists.delete(ws);
+  live.queues.delete(ws);
+  live.backfilled!.delete(ws);
+  const file = fileOf(ws);
+  if (file) rmSync(/*turbopackIgnore: true*/ file, { force: true });
 }

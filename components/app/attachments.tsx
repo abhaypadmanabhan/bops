@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { Message } from "@/lib/types";
+import { readAllowed } from "./view-only";
 
 /**
  * Images in chat: attaching them (the + button, pasting, dropping), the tray of what's about to be
@@ -61,11 +62,14 @@ export function useAttachments() {
     live.current = items;
   });
   useEffect(() => () => live.current.forEach((a) => URL.revokeObjectURL(a.preview)), []);
+  /** Adds them (images only, ten in all at most); answers the keys of the ones added. */
   const add = useCallback((files: Iterable<File>) => {
     // Ten at most: one past that is not added, or uploaded.
     const fresh = [...files].filter((f) => f.type.startsWith("image/")).slice(0, Math.max(0, 10 - live.current.length));
+    const keys: string[] = [];
     for (const file of fresh) {
       const key = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      keys.push(key);
       const preview = URL.createObjectURL(file);
       const done = (async (): Promise<Pic | null> => {
         try {
@@ -83,6 +87,7 @@ export function useAttachments() {
       })();
       setItems((xs) => [...xs, { key, preview, status: "uploading" as const, done }].slice(0, 10));
     }
+    return keys;
   }, []);
   const remove = useCallback((key: string) => {
     const gone = live.current.find((x) => x.key === key);
@@ -129,6 +134,13 @@ export function MessageImages({ images, previews, align = "end" }: { images?: Pi
   const [open, setOpen] = useState<string | null>(null);
   const srcs = previews ?? (images ?? []).map((i) => `/api/uploads/${i.id}`);
   if (!srcs.length) return null;
+  // A workspace shared with the user: its images are the owner's, kept where they were sent from, not here.
+  if (!previews && !readAllowed(srcs[0]))
+    return (
+      <div className={`rounded-[14px] px-3 py-2 text-[12.5px] leading-4 text-[#6B6B6B] shadow-[0_0_0_1px_#E6E6E3] ${align === "end" ? "self-end" : "self-start"}`}>
+        {srcs.length === 1 ? "An image" : `${srcs.length} images`}. Images in a shared workspace aren&apos;t shown yet.
+      </div>
+    );
   const one = srcs.length === 1;
   const ratio = (i: number) => (images?.[i]?.w && images[i].h ? images[i].w! / images[i].h! : undefined);
   return (

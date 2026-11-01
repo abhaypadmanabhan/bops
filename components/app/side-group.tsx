@@ -4,7 +4,8 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState, type A
 import { ago } from "./ui";
 
 /*
- * What the sidebar's pinned groups share: Routines (autopilot.tsx) and Orbit (memory-categories.tsx).
+ * What the sidebar's pinned groups share: Routines (autopilot.tsx), Orbit (memory-categories.tsx) and the
+ * sidebar's own sections, Needs you, Favorites and each bot's threads (sidebar-sections.tsx).
  * Counts that tick when they go up, the chevron that folds, the arrow that opens a group's page, where
  * this Mac keeps what the user folded, the small × that deletes from a row, one remove question at a time
  * in a list and where focus goes once a row is deleted, and the marks that make only what arrives after
@@ -163,7 +164,27 @@ export function useRise(fresh: () => boolean) {
  * while it goes). Cancel, the safe choice, has focus, so Enter, Space and Esc all cancel; Esc cancels and
  * only that (preventDefault keeps the page open), even while it works.
  */
-export function InlineConfirm({ text, action, doing, busy, onConfirm, onCancel }: { text: string; action: string; doing: string; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
+export function InlineConfirm({
+  text,
+  action,
+  doing,
+  busy,
+  onConfirm,
+  onCancel,
+  extra,
+  cancel: cancelWord = "Cancel",
+}: {
+  text: string;
+  action: string;
+  /** The safe choice's word (Cancel, or Keep). */
+  cancel?: string;
+  doing: string;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  /** More to choose before confirming (a box to tick), on a line of its own under the question. */
+  extra?: ReactNode;
+}) {
   const box = useRef<HTMLDivElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
   const was = useRef(busy);
@@ -198,9 +219,10 @@ export function InlineConfirm({ text, action, doing, busy, onConfirm, onCancel }
           disabled={busy}
           className="rounded-full px-2.5 py-1 text-[12px] font-medium leading-4 text-[#3A3A38] outline-none hover:bg-white focus-visible:shadow-[0_0_0_1.5px_#0A0A0A] disabled:opacity-40"
         >
-          Cancel
+          {cancelWord}
         </button>
       </span>
+      {extra && <span className="basis-full">{extra}</span>}
     </div>
   );
 }

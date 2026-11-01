@@ -92,10 +92,24 @@ const test = async (name, f) => {
 /* ---------------- Forget, with Undo ---------------- */
 
 const UNDO_MS = 5_000;
-// Real timers, but Forget's 5 seconds made short: setTimeout of 5000 here runs in 30ms.
+// Real timers, but Forget's 5 seconds pass only when a test says so (fiveSecondsPass), never on their own:
+// a short real timer raced settle() and, on a busy machine, sent a Forget before the test looked.
 const realSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = (f, ms, ...a) => realSetTimeout(f, ms === UNDO_MS ? 30 : ms, ...a);
-const wait = (ms) => new Promise((r) => realSetTimeout(r, ms));
+const realClearTimeout = globalThis.clearTimeout;
+const held = new Map();
+globalThis.setTimeout = (f, ms, ...a) => {
+  if (ms !== UNDO_MS) return realSetTimeout(f, ms, ...a);
+  const handle = { held: true };
+  held.set(handle, () => f(...a));
+  return handle;
+};
+globalThis.clearTimeout = (t) => (held.has(t) ? held.delete(t) : realClearTimeout(t));
+const fiveSecondsPass = async () => {
+  const due = [...held.values()];
+  held.clear();
+  for (const f of due) f();
+  await settle();
+};
 
 answer = (url, method, body) => {
   if (url.startsWith("/api/memory/categories") && method === "GET") return { status: 200, body: snap() };
@@ -125,7 +139,7 @@ await test("Undo brings it back and it's never sent", async () => {
   orbitStore.undo("u1", "w1");
   assert.equal(orbitStore.view("u1", "w1").items.length, 3);
   assert.equal(orbitStore.forgetting("u1", "w1").undo, null);
-  await wait(60);
+  await fiveSecondsPass();
   assert.equal(calls.filter((c) => c.body?.action === "forget").length, 0);
 });
 
@@ -135,8 +149,7 @@ await test("after 5 seconds it's sent, with every id, and stays gone", async () 
     { id: "bbbbbbbbbb", title: "Dana Lee" },
   ]);
   assert.equal(orbitStore.forgetting("u1", "w1").undo?.label, "Forgot 2 items");
-  await wait(60);
-  await settle();
+  await fiveSecondsPass();
   const sent = calls.filter((c) => c.body?.action === "forget");
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0].body, { action: "forget", ids: ["aaaaaaaaaa", "bbbbbbbbbb"], ws: "w1" });
@@ -165,8 +178,7 @@ await test("one that fails comes back, and the page is told why", async () => {
   assert.equal(before.length, 2);
   orbitStore.forget("u1", "w1", [{ id: before[0], title: "x" }]);
   assert.equal(orbitStore.view("u1", "w1").items.length, before.length - 1);
-  await wait(60);
-  await settle();
+  await fiveSecondsPass();
   assert.deepEqual(orbitStore.view("u1", "w1").items.map((i) => i.id), before);
   assert.equal(orbitStore.forgetting("u1", "w1").error, "Memory said no.");
   answer = was;
@@ -325,18 +337,8 @@ await test("Skills and Apps, kinds in Knowledge: Skills chip after Issues with i
   assert.match(t, /Standup post/);
   assert.ok(!/Invoice total/.test(t), "apps are on their own page");
   assert.match(t, /Draft/);
-  // Opened on Apps: only the apps, its chip the one picked.
-  const appsHtml = renderToStaticMarkup(h(MemoryView, { state, user: "u1", ws: "w1", category: "apps", onCategory: noop, onClose: noop }));
-  t = text(appsHtml);
-  assert.match(t, /^ ?Apps Programs and tools/);
-  // The Apps chip is hidden in the prod build for now.
-  assert.ok(!/aria-pressed="[^"]*"[^>]*>Apps/.test(appsHtml));
-  assert.match(t, /Invoice total/);
-  assert.ok(!/Standup post/.test(t));
-  // No apps: says so (an empty page, not other sections).
-  const noApps = { ...state, workspaces: [{ ...state.workspaces[0], apps: [] }] };
-  t = text(renderToStaticMarkup(h(MemoryView, { state: noApps, user: "u1", ws: "w1", category: "apps", onCategory: noop, onClose: noop })));
-  assert.match(t, /No apps yet\./);
+  // Knowledge has no Apps (Apps are the apps bots make, from the footer): no chip, and no page for them here.
+  assert.ok(!/>Apps</.test(html), "no Apps chip in Knowledge");
   // No drafts: only the count.
   const published = { ...state, workspaces: [{ ...state.workspaces[0], skills: [ref("skill", "standup-post", "Standup post")] }] };
   t = text(renderToStaticMarkup(h(MemoryView, { state: published, user: "u1", ws: "w1", category: "skills", onCategory: noop, onClose: noop })));
@@ -346,8 +348,6 @@ await test("Skills and Apps, kinds in Knowledge: Skills chip after Issues with i
   t = text(renderToStaticMarkup(h(MemoryView, { state: { ...state, account: undefined }, ws: "w1", category: "skills", onCategory: noop, onClose: noop })));
   assert.match(t, /Standup post/);
   assert.ok(!/Issues/.test(t), "no chips without an account");
-  t = text(renderToStaticMarkup(h(MemoryView, { state: { ...state, account: undefined }, ws: "w1", category: "apps", onCategory: noop, onClose: noop })));
-  assert.match(t, /Invoice total/);
 });
 
 await test("Routines in the footer: a round button, with how many monitors have news", async () => {
@@ -848,8 +848,41 @@ await test("near the bottom of the window it opens above its anchor", async () =
   }
 });
 
+await test("an issue from Gmail shows the email itself under its summary, read from its own route as it opens (source-view.tsx, scripts/test-source-view.mjs); one from Plain reads nothing", async () => {
+  const thread = {
+    app: "gmail",
+    account: { id: "ca_1", title: "Work" },
+    threadId: "18c0a1b2c3d4e5f6",
+    subject: "Acme is down",
+    messages: [{ id: "g1", from: { name: "Kevin Example", email: "kevin@example.com" }, to: [{ email: "alex@example.com", me: true }], cc: [], at: 1000, snippet: "Nothing loads", body: "Nothing loads since 9.", files: [] }],
+    reply: { to: { name: "Kevin Example", email: "kevin@example.com" }, all: { to: [], cc: [] } },
+  };
+  tagged = [issue("issue-9", { ws: "w9", sourceApp: "gmail", summary: "Acme can't load the dashboard.", url: "https://mail.google.com/mail/u/0/#inbox/18c0a1b2c3d4e5f6" }), issue("issue-8", { ws: "w9", sourceApp: "plain", summary: "A ticket." })];
+  const before = answer;
+  answer = (url, method, body) => (url === "/api/orbit/issues/issue-9/source?ws=w9" && method === "GET" ? { status: 200, body: { source: thread } } : before(url, method, body));
+  const m = await mount(opened("issue-9", "u9src"));
+  try {
+    assert.ok(calls.some((c) => c.url === "/api/orbit/issues/issue-9/source?ws=w9" && c.method === "GET"));
+    const text = m.box.textContent;
+    const at = (s) => text.indexOf(s);
+    assert.ok(at("Acme can't load the dashboard.") < at("Open in Gmail") && at("Open in Gmail") < at("Acme is down") && at("Acme is down") < at("History"), "summary, its link, the email, then the history");
+    assert.ok(m.box.querySelector('[data-thread="gmail"] [data-reply] textarea'));
+  } finally {
+    await m.done();
+    answer = before;
+  }
+  calls.length = 0;
+  const n = await mount(opened("issue-8", "u9src2"));
+  try {
+    assert.ok(!calls.some((c) => c.url.includes("/source")), "nothing to read for Plain");
+    assert.ok(!n.box.querySelector("[data-source]"));
+  } finally {
+    await n.done();
+  }
+});
+
 await test("no em or en dashes in what these files show", async () => {
-  for (const f of ["components/app/orbit-issues.tsx", "components/app/memory-categories.tsx", "components/app/autopilot.tsx", "components/app/skills.tsx"]) {
+  for (const f of ["components/app/orbit-issues.tsx", "components/app/memory-categories.tsx", "components/app/autopilot.tsx", "components/app/skills.tsx", "components/app/source-view.tsx", "components/app/reply-drafts.tsx"]) {
     const src = readFileSync(`${root}/${f}`, "utf8");
     // Strings and JSX text only: the comments may say anything.
     const shown = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");

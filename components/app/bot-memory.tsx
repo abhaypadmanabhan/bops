@@ -1,12 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { AppState, Bot, Session } from "@/lib/types";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { waitsForOk, workspaceOf, type AppState, type Bot, type Session } from "@/lib/types";
+import { entryOf, teamIn } from "@/lib/chain";
 import { MemorySheet } from "./memory-sheet";
-import { ago, post, quietNothing, StatusIcon } from "./ui";
+import { ago, memberAnswers, post, quietNothing, StatusIcon } from "./ui";
+import { you } from "@/lib/shared";
 
 type Fact = { id: string; text: string; private: boolean; at?: number; source?: string };
-type Data = { workspace: string; ws: string; card: Fact[]; facts: Fact[]; error?: string };
+type Data = { workspace: string; ws: string; own?: boolean; card: Fact[]; facts: Fact[]; error?: string };
+/** The bot whose own memory the tab shows (it keeps its memory to itself: lib/chain.ts), so a change goes to its own bank. */
+const OwnMemoryOf = createContext<string | undefined>(undefined);
 /** Each bot's Memory tab as last loaded, so opening it again is instant (then it refreshes). */
 const seen = new Map<string, Data>();
 
@@ -84,6 +88,7 @@ export function BotMemory({ state, bot: b, onOpenThread }: { state: AppState; bo
   const learned = data?.facts ?? [];
 
   return (
+    <OwnMemoryOf.Provider value={data?.own ? b.id : undefined}>
     <div className="mx-auto flex w-full max-w-[640px] flex-col gap-7 pb-6">
       <form
         onSubmit={(e) => {
@@ -113,7 +118,7 @@ export function BotMemory({ state, bot: b, onOpenThread }: { state: AppState; bo
             setAnswer(null);
             setResults(null);
           }}
-          placeholder={`Ask ${b.name} what it knows about you`}
+          placeholder={`Ask ${b.name} what it knows about ${you(state)}`}
           className="h-8 min-w-0 flex-1 bg-transparent text-[14px] outline-none placeholder:text-[#9A9A98]"
         />
         {searching && (
@@ -197,7 +202,7 @@ export function BotMemory({ state, bot: b, onOpenThread }: { state: AppState; bo
                   {(allWork ? done : done.slice(0, 3)).map((s) => (
                     <button key={s.id} onClick={() => onOpenThread(s)} className="-mx-2.5 flex items-start gap-2.5 rounded-[12px] px-2.5 py-2 text-left hover:bg-[#F7F7F6]">
                       <span className="mt-0.5">
-                        <StatusIcon session={s} />
+                        <StatusIcon session={s} owner={!!state.shared && !memberAnswers(state, s)} member={memberAnswers(state, s)} okWait={waitsForOk(s, state)} />
                       </span>
                       <span className="min-w-0 flex-1">
                         <span className="flex items-baseline gap-2">
@@ -216,16 +221,54 @@ export function BotMemory({ state, bot: b, onOpenThread }: { state: AppState; bo
             )}
           </Section>
 
-          <div className="text-center text-[12px] leading-4 text-[#9A9A98]">
-            Everyone on the {data.workspace} team shares this memory.{" "}
-            <button onClick={() => setManage(true)} className="font-medium text-[#6B6B6B] underline decoration-[#D9D9D6] underline-offset-2 hover:text-ink">
-              Manage
-            </button>
-          </div>
+          {data.own ? (
+            <div className="text-center text-[12px] leading-4 text-[#9A9A98]">{b.name} keeps its memory to itself: only it reads this.</div>
+          ) : (
+            <div className="text-center text-[12px] leading-4 text-[#9A9A98]">
+              Everyone on the {data.workspace} team shares this memory.{" "}
+              {!manage && (
+                <button onClick={() => setManage(true)} aria-expanded={manage} className="font-medium text-[#6B6B6B] underline decoration-[#D9D9D6] underline-offset-2 hover:text-ink">
+                  Manage
+                </button>
+              )}
+            </div>
+          )}
+          {/* Manage: the workspace's memory, here in place under it. */}
+          {manage && !data.own && <MemorySheet state={state} onClose={() => setManage(false)} />}
+          {/* What it kept to itself before, kept apart on the team chart: brought into the team's, or let go. */}
+          {!data.own && !state.shared && entryOf(teamIn(state, workspaceOf(b)), b.id).kept && <KeptApart bot={b} onDone={reload} />}
         </>
       )}
 
-      {manage && <MemorySheet state={state} onClose={() => setManage(false)} />}
+    </div>
+    </OwnMemoryOf.Provider>
+  );
+}
+
+/** What a bot kept to itself before, kept apart (the team chart's Keep it apart): brought into the team's memory, or deleted. */
+function KeptApart({ bot: b, onDone }: { bot: Bot; onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const act = async (action: "bring-in" | "drop-own") => {
+    setBusy(true);
+    setError(null);
+    const r = (await (await post("/api/memory", { action, bot: b.id })).json().catch(() => ({ error: "x" }))) as { error?: string };
+    setBusy(false);
+    if (r.error) setError("Couldn't do that. Try again.");
+    onDone();
+  };
+  return (
+    <div data-kept-apart className="flex flex-col items-center gap-2 text-center text-[12px] leading-4 text-[#6B6B6B]">
+      <span>What {b.name} kept to itself is kept apart: nothing reads it.</span>
+      <span className="flex gap-2">
+        <button disabled={busy} onClick={() => void act("bring-in")} className="rounded-full bg-[#F2F2F0] px-3 py-1 font-medium text-ink hover:bg-[#EAEAE7] disabled:opacity-50">
+          Bring it in
+        </button>
+        <button disabled={busy} onClick={() => void act("drop-own")} className="rounded-full bg-[#F2F2F0] px-3 py-1 font-medium text-[#B42318] hover:bg-[#EAEAE7] disabled:opacity-50">
+          Delete it
+        </button>
+      </span>
+      {error && <span role="alert" className="text-[#B42318]">{error}</span>}
     </div>
   );
 }
@@ -406,9 +449,10 @@ function Editable({ ws, item, onChange, pinnable, children }: { ws: string; item
     document.addEventListener("mousedown", away);
     return () => document.removeEventListener("mousedown", away);
   }, [menu]);
+  const ownOf = useContext(OwnMemoryOf);
   const act = async (body: Record<string, unknown>) => {
     setMenu(false);
-    const r = (await (await post("/api/memory", { ws, ...body })).json()) as { error?: string };
+    const r = (await (await post("/api/memory", { ws, ...(ownOf ? { bot: ownOf } : {}), ...body })).json()) as { error?: string };
     if (r.error) setError(r.error);
     onChange();
   };
@@ -441,7 +485,7 @@ function Editable({ ws, item, onChange, pinnable, children }: { ws: string; item
         tabIndex={0}
         onClick={() => setMenu((m) => !m)}
         onKeyDown={(e) => e.key === "Enter" && setMenu((m) => !m)}
-        className={`-mx-1 cursor-pointer rounded-[6px] px-1 transition-colors ${menu ? "bg-[#F2F2F0]" : "hover:bg-[#F7F7F6]"}`}
+        className={`-mx-1 rounded-[6px] px-1 transition-colors ${menu ? "bg-[#F2F2F0]" : "hover:bg-[#F7F7F6]"}`}
       >
         {children}
       </span>

@@ -2,27 +2,86 @@
 
 import { screenMap, screenNo } from "@/lib/screens";
 import { askKind, chatAsks } from "@/lib/asks";
+import { alwaysScope, toDo } from "@/lib/permission";
 import { createContext, Fragment, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { BLOCKER_ASK, BRAINS_ON, brainOf, live, pairChatId, threadRunner, workspaceOf, TAPBACK_EMOJI, TAPBACKS, type AppApproval, type AppState, type Bot, type Chat, type Message, type Session, type Tapback } from "@/lib/types";
+import { BLOCKER_ASK, BRAINS_ON, COMPACTED, live, ownerSent, pairChatId, routineSent, threadCompactBlocked, threadCompacts, threadRunner, waitingAsks, WAITING_FOR_OK, waitsForOk, workspaceOf, TAPBACK_EMOJI, TAPBACKS, type AppApproval, type AppState, type Blocker, type Bot, type Chat, type MadeApp, type Message, type Session, type Tapback, type ThreadReply } from "@/lib/types";
 import { Tapback as TapbackBalloon, TapbackGlyph, tapbackVars } from "@/components/message-ui/tapback";
 import { Mascot } from "./mascot";
-import { OpenLink } from "./panel-tabs";
+import { OpenBotLocal, OpenLink, OpenPreview } from "./panel-tabs";
+import { appCoders } from "@/lib/hosted-apps";
+import { appsShown } from "@/lib/apps-access";
+import { appsOwnShown } from "@/lib/apps-access";
 import { crmOpen } from "@/lib/crm-access";
+import { answersAsk, canAct, isViewerOwn, OWNER_ONLY_LINE, ownerWho, readOnly, saidBy, saidName, writesThread } from "@/lib/shared";
+import { memberAct } from "./shared-act";
+import { MEMBER_STOP_MAX } from "@/cloud/protocol";
 import { CrmNote } from "./crm";
+import { AppChangeCard } from "./app-change";
+import { LookingAt, MadeAppLine } from "./made-apps";
 import { MacIcon } from "./mac-tab";
 import { AttachmentTray, MessageImages, useAttachments } from "./attachments";
+import { useComposerListen, withLine, type ComposerReceiver } from "./composer-bridge";
 import { ComposerInput } from "./composer-input";
 import { MicButton } from "./mic-button";
 import { Fold } from "./fold";
 import { SaveSkillDialog } from "./skill-dialog";
 import { undash } from "./side-group";
+import { SelectIcon, TickBar, TickRow, TrashIcon, UndoLine, useMessageDeletes, type Gone } from "./message-deletes";
+import { num, privacyOf } from "@/lib/privacy";
+import { compactBlocked } from "@/lib/chat-summary";
 import { ApiAsk, apiAskOf, apiCallOf, ApiNote } from "./keys";
 import { BrainBadge, brainSignIn, openInTerminal, threadBadge } from "./brains";
-import { ChatAvatar, chatName, clockTime, needsYou, post, StatusIcon, teamOf, useNow } from "./ui";
+import { AGENTS, aiOf, hasProfile, isCli, threadAgent, upper } from "@/lib/agents";
+import { AgentChip, AgentMark } from "./agent-marks";
+import { threadAgentWords, threadKind } from "./bot-ai";
+import { AgentChipPick, boxAgents, pickLine, useBotKeys } from "./new-thread";
+import { AskInPlace, ChatAvatar, chatName, clockTime, memberAnswers, needsYou, post, ReadOnlyLine, StatusIcon, teamOf, useNow } from "./ui";
+import { ReplyDrafts } from "./reply-drafts";
+import { dropCitations, plainStep } from "@/lib/plain-words";
+import { SkillProposals } from "./skill-proposals";
 
 /** Light markdown for bot text: **bold** and [links](url). */
 /** How many messages a chat draws at first, and how many more each "Show earlier messages" adds. */
 const PAGE = 60;
+
+/**
+ * Who a chat's sentences say something waits on or was emailed to: the user ("you") in their own
+ * workspace, its owner ("the owner") in one shared with them, where none of it is the viewer's (ownerWho).
+ */
+const ownerYou = (state: AppState) => (state.shared ? "the owner" : "you");
+/** Whose message the reply bar names, as "Replying to …" says it: "yourself", "the owner" or a member by name (saidBy). */
+function repliedToWho(m: Message, state: AppState): string {
+  const who = saidBy(m, state);
+  return who === "you" || who === null ? "yourself" : who === "owner" ? "the owner" : who.name;
+}
+
+/**
+ * A card in a shared workspace that only the owner can answer or act on (`only`): an ask of a bot the viewer has at
+ * Read, of a thread on the owner's Mac, to use the owner's apps or keys, or to approve on the owner's phone. Dimmed,
+ * nothing on it does anything, and a line says so, so it never looks like one of theirs that just doesn't work.
+ */
+function OwnerOnly({ only, children }: { only: boolean; children: React.ReactNode }) {
+  if (!only) return <div className="contents">{children}</div>;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="opacity-60" inert>
+        {children}
+      </div>
+      <span className="pl-1 text-[12px] leading-4 text-[#9A9A98]">{OWNER_ONLY_LINE}</span>
+    </div>
+  );
+}
+/** Whose Mac a thread runs on or could move to, the same way: "Your Mac", or the owner's in a shared workspace. */
+const ownerMac = (state: AppState) => (state.shared ? "Owner's Mac" : "Your Mac");
+/** What a blocked thread needs (BLOCKER_ASK says it of the user), of the owner in a shared workspace. */
+const OWNER_BLOCKER_ASK: Record<Blocker, string> = {
+  sign_in: "the owner to sign in",
+  two_factor: "a code from the owner",
+  captcha: "the owner to pass a captcha",
+  payment: "the owner's OK to pay",
+  error: "the owner: the page errored",
+};
+const blockerAsk = (state: AppState, b: Blocker) => (state.shared ? OWNER_BLOCKER_ASK[b] : BLOCKER_ASK[b]);
 
 /** The bot whose text this is, so a file it links opens from its computer (see Inline). */
 const LinkedBy = createContext<string | undefined>(undefined);
@@ -32,7 +91,8 @@ const isFileLink = (href: string) => /^(\/workspace\/|~\/|\/Users\/|file:\/\/\/)
 
 export function Rich({ text, botId }: { text: string; botId?: string }) {
   // Code blocks (ASCII diagrams, commands) keep their monospace layout; the rest is inline text.
-  const blocks = text.split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
+  // A model's citation markers are for it, not for people: they go.
+  const blocks = dropCitations(text).split(/```[a-z0-9-]*\n?([\s\S]*?)```/g);
   return (
     <LinkedBy.Provider value={botId}>
       {blocks.map((b, i) =>
@@ -127,11 +187,15 @@ function Inline({ text }: { text: string }) {
   // Links open as a tab on the right; ⌘-click still opens your browser. A page a bot made opens there too.
   // So does a file it linked: Bops fetches it from the bot's computer (or this Mac) first, as the link itself goes nowhere.
   const openLink = useContext(OpenLink);
+  const openLocal = useContext(OpenBotLocal);
   const botId = useContext(LinkedBy);
+  // A file that couldn't be opened says why right after the text, in place (never a browser alert), until the next try.
+  const [failed, setFailed] = useState<string | null>(null);
   const openFile = async (href: string, label: string, browser: boolean) => {
-    const res = await fetch("/api/files", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ botId, href }) });
-    const r = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
-    if (!r.url) return window.alert(r.error ?? "Couldn't open that file.");
+    setFailed(null);
+    const res = await fetch("/api/files", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ botId, href }) }).catch(() => null);
+    const r = ((await res?.json().catch(() => ({}))) ?? {}) as { url?: string; error?: string };
+    if (!r.url) return setFailed(res ? (r.error ?? "Couldn't open that file.") : "Couldn't reach Bops.");
     const url = new URL(r.url, window.location.href).href;
     if (browser || !openLink) window.open(url, "_blank");
     else openLink(url, label);
@@ -160,6 +224,12 @@ function Inline({ text }: { text: string }) {
                   void openFile(link[2], link[1], e.metaKey || e.ctrlKey || e.shiftKey);
                   return;
                 }
+                // A bot's localhost link is its app's Local: its preview beside the chat (else its screen), never this Mac's own localhost.
+                if (botId && openLocal && /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/|$)/i.test(link[2])) {
+                  e.preventDefault();
+                  openLocal(botId, link[2]);
+                  return;
+                }
                 if (!openLink || e.metaKey || e.ctrlKey || e.shiftKey || !(page || /^https?:/.test(link[2]))) return;
                 e.preventDefault();
                 openLink(page ? new URL(link[2], window.location.href).href : link[2], page ? link[1] : undefined);
@@ -172,6 +242,12 @@ function Inline({ text }: { text: string }) {
         }
         return <Fragment key={i}>{p}</Fragment>;
       })}
+      {failed && (
+        <span role="alert" className="text-[12.5px] text-[#B42318]">
+          {" "}
+          {failed}
+        </span>
+      )}
     </>
   );
 }
@@ -182,6 +258,7 @@ export function ChatView({
   state,
   chat: c,
   wide,
+  lookingAt,
   onOpenThread,
   onShowBot,
   onShowMac,
@@ -198,12 +275,14 @@ export function ChatView({
   chat: Chat;
   /** The right panel is collapsed, so the chat centers itself. */
   wide: boolean;
+  /** An app a bot made, open beside the chat: what the user says is about it, unless they say otherwise (made-apps.tsx). */
+  lookingAt?: MadeApp;
   onOpenThread: (s: Session) => void;
   onShowBot: (botId: string) => void;
   /** Open the "Your Mac" tab. */
   onShowMac: () => void;
-  /** Open a bot's computer on one screen, e.g. the watched screen a heads-up is about. */
-  onShowScreen: (botId: string, display: number) => void;
+  /** Open a bot's computer on one screen, e.g. the watched screen a heads-up is about; `sessionId`, for the thread waiting there whose card it's from. */
+  onShowScreen: (botId: string, display: number, sessionId?: string) => void;
   /** Open the Account sheet, where AI credit is bought. */
   onUpgrade?: () => void;
   peek?: React.ReactNode;
@@ -220,6 +299,9 @@ export function ChatView({
   prefill?: { chatId: string; text: string; at: number } | null;
   onPrefilled?: () => void;
 }) {
+  // The agent picked in the message box for the threads the next messages start (new-thread.tsx AgentChipPick):
+  // this chat's, in this window only, until changed. Null: the bot's Default.
+  const [agentPicks, setAgentPicks] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState("");
   // The last ask put in the box (its prefill.at): in once, while this chat shows, then left alone.
   const [prefilled, setPrefilled] = useState<number | null>(null);
@@ -242,11 +324,16 @@ export function ChatView({
     }
     prefilledDone.current?.();
   }, [prefilled]);
+  // The app the user took the "Looking at" chip off: what they say isn't about it, until they open another.
+  const [notLooking, setNotLooking] = useState<string | null>(null);
+  const looking = lookingAt && notLooking !== lookingAt.id ? lookingAt : undefined;
   // The message an inline reply is to (iMessage's swipe-to-reply), and the reply view that's open.
   const [replyingTo, setReplying] = useState<Message | null>(null);
   const [repliesOpen, setRepliesOpen] = useState<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
-  const messages = useMemo(() => state.messages.filter((m) => m.chatId === c.id), [state.messages, c.id]);
+  // Deleting messages (message-deletes.tsx): what's on its way out isn't shown, and its line offers Undo.
+  const deletes = useMessageDeletes(state);
+  const messages = useMemo(() => state.messages.filter((m) => m.chatId === c.id && !deletes.hidden.has(m.id)), [state.messages, c.id, deletes.hidden]);
   // Only the latest messages are drawn (a long chat had hundreds, all rendered and laid out on every
   // update); "Show earlier messages" adds more. A different chat starts again from the latest.
   const [window_, setWindow] = useState<{ chat: string; shown: number }>({ chat: c.id, shown: PAGE });
@@ -254,6 +341,13 @@ export function ChatView({
   const setShown = (f: (n: number) => number) => setWindow({ chat: c.id, shown: f(shown) });
   const hiddenCount = Math.max(0, messages.length - shown);
   const visible = hiddenCount ? messages.slice(hiddenCount) : messages;
+  // A shared workspace's chat with older messages in Bops Cloud than the window has: read a page more as
+  // the ones here run out (lib/server/shared-core.ts SharedCopy.older).
+  const olderThere = !!state.shared?.more?.includes(c.id);
+  const showEarlier = () => {
+    setShown((n) => n + PAGE);
+    if (olderThere && hiddenCount < 2 * PAGE) void post("/api/workspaces/shared", { older: c.id });
+  };
   // A thread gets one chip, on the latest message about it, so it moves down as the thread moves on.
   const chipHome = useMemo(() => {
     const home = new Map<string, string>();
@@ -262,15 +356,27 @@ export function ChatView({
   }, [messages]);
   const members = c.botIds.map((b) => state.bots.find((x) => x.id === b)).filter(Boolean) as Bot[];
   // What's waiting on you, pinned over the composer: threads started here (in the main bot's chat,
-  // every bot's: lib/asks.ts chatAsks), and app actions asked here or by one of those threads.
-  const threadAsks = chatAsks(state, c.id);
+  // every bot's: lib/asks.ts chatAsks), and what a bot asked your OK for here or in one of those threads,
+  // wherever its run runs (a bot's computer too: the requests are shared, lib/server/permission.ts). A thread
+  // waiting for your OK shows as its request's card.
   const mainChat = c.kind === "bot" && state.bots.some((b) => b.isMain && c.botIds.includes(b.id));
-  const appAsks = (state.appApprovals ?? []).filter(
-    (a) => a.chatId === c.id || state.sessions.some((x) => x.id === a.sessionId && x.chatId === c.id) || (mainChat && workspaceOf(state.bots.find((b) => b.id === a.botId) ?? members[0]) === workspaceOf(members[0])),
+  const appAsks = waitingAsks(state).filter(
+    (a) => a.chatId === c.id || state.sessions.some((x) => x.id === a.threadId && x.chatId === c.id) || (mainChat && workspaceOf(state.bots.find((b) => b.id === a.botId) ?? members[0]) === workspaceOf(members[0])),
   );
+  const threadAsks = chatAsks(state, c.id).filter((x) => !appAsks.some((a) => a.threadId === x.id));
   const [allAsks, setAllAsks] = useState(false);
   const shownAsks = allAsks ? threadAsks : threadAsks.slice(0, 2);
   const solo = c.kind === "bot" ? members[0] : undefined;
+  // The agent picked in the box: only one the bot can run now (else its Default, which the chip shows as it is).
+  // A pick that isn't ready anymore is never sent, and is let go as the next message goes.
+  const boxKeys = useBotKeys(state, solo);
+  const picked = solo && agentPicks[c.id] ? boxAgents(state, solo, agentPicks[c.id], boxKeys).picked : undefined;
+  const dropPick = () =>
+    setAgentPicks((p) => {
+      const next = { ...p };
+      delete next[c.id];
+      return next;
+    });
   // A bot's chat shows all its work; a group only the threads started in that group.
   const running = state.sessions.filter((s) => live(s) && (c.kind === "group" ? s.chatId === c.id : c.botIds.includes(s.botId)));
   const sessionById = (sid: string) => state.sessions.find((s) => s.id === sid);
@@ -300,17 +406,77 @@ export function ChatView({
     onReply: () => startReply(m),
     onOpenReplies: () => setRepliesOpen(m.replyTo ?? m.id),
     onShowMac,
+    // A shared workspace's messages are its owner's: never deleted from here.
+    onDelete: state.shared ? undefined : () => deletes.remove(m.chatId, [m], { mine: saidBy(m, state) === "you" }),
   });
+  // Select messages (the chat's menu): the ones picked, in this chat only; Esc leaves it.
+  const [selecting, setSelecting] = useState<{ chat: string; ids: string[] } | null>(null);
+  const ticking = selecting?.chat === c.id && !state.shared ? selecting : null;
+  const ticked = useMemo(() => new Set(ticking?.ids ?? []), [ticking]);
+  const tick = (id: string) => setSelecting((x) => (x && x.chat === c.id ? { ...x, ids: x.ids.includes(id) ? x.ids.filter((y) => y !== id) : [...x.ids, id] } : x));
+  useEffect(() => {
+    if (!ticking) return;
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSelecting(null);
+    };
+    window.addEventListener("keydown", esc, true);
+    return () => window.removeEventListener("keydown", esc, true);
+  }, [ticking]);
+  // Delete all messages (the chat's menu), asked in place of the message box first.
+  const [clearing, setClearing] = useState<string | null>(null);
+  const askingClear = clearing === c.id && !state.shared && messages.length > 0;
+  const keptDays = privacyOf(state).deletedDays;
   const repliedAfterUser = messages.slice(lastUserIdx + 1).some((m) => m.role === "bot");
+  // Compact (the chat's menu): every message up to now into the chat's summary, and its bots read it afresh from here
+  // (lib/server/chat-summary.ts). The owner's, and in a shared workspace a member's with Write on every bot in it, as
+  // saying something there takes (through the owner's Bops: shared-act.ts). Off while a bot answers, or with nothing new.
+  const mayCompact = !readOnly(state, c.botIds);
+  const [compacting, setCompacting] = useState<{ chat: string; error?: string } | null>(null);
+  const compactingHere = compacting?.chat === c.id ? compacting : null;
+  const compactOff = compactingHere && !compactingHere.error ? "Compacting" : compactBlocked(c, messages, (id) => state.bots.find((x) => x.id === id)?.name);
+  const compact = async () => {
+    setCompacting({ chat: c.id });
+    const r = state.shared ? await memberAct({ act: "compact", chatId: c.id }) : await answered(post(`/api/chats/${encodeURIComponent(c.id)}/compact`));
+    setCompacting(r.ok ? null : { chat: c.id, error: r.error || DIDNT_COMPACT });
+  };
 
   // Opening a chat lands on its latest message; only new messages in the open chat glide in.
   const shownChat = useRef<string | null>(null);
+  // Whether the reader is at the latest message, so the chat follows it.
+  const follow = useRef(true);
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
+    follow.current = true;
     el.scrollTo({ top: el.scrollHeight, behavior: shownChat.current === c.id && !matchMedia("(prefers-reduced-motion: reduce)").matches ? "smooth" : "instant" });
     shownChat.current = c.id;
   }, [messages.length, c.typing.length, c.id]);
+  // A reader at the bottom stays there when the column changes size (the side panel opening makes every bubble
+  // taller): they never land on old messages. One who scrolled up keeps their place. The chat only ever scrolls
+  // itself down, so moving up away from the bottom is always the reader's own.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el || typeof ResizeObserver !== "function") return;
+    let top = el.scrollTop;
+    const onScroll = () => {
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 40) follow.current = true;
+      else if (el.scrollTop < top) follow.current = false;
+      top = el.scrollTop;
+    };
+    const ro = new ResizeObserver(() => {
+      if (follow.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      ro.disconnect();
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, [c.id]);
 
   // Marked read only when there's something unread: each mark is a state change every open page reloads.
   const lastAt = messages.at(-1)?.at ?? 0;
@@ -325,6 +491,31 @@ export function ChatView({
   const [sent, setSent] = useState<{ chatId: string; text: string; at: number }[]>([]);
   // Images about to go with the next message (the + button, pasting, or dropping them on the chat).
   const attach = useAttachments();
+  // What the Preview tab's Select and Draw put in the box (composer-bridge.tsx), never sent by themselves: its
+  // pictures' keys in the tray and its lines in the draft (each with where it is in the page's code, never shown), so
+  // the message that goes with any of them still there is tagged appNote, and carries those lines' code for the bot.
+  const fromApp = useRef({ keys: new Set<string>(), lines: new Map<string, string[]>() });
+  const listen = useComposerListen();
+  const receive = useRef<ComposerReceiver>(() => {});
+  useLayoutEffect(() => {
+    receive.current = (files, line, code) => {
+      for (const k of attach.add(files)) fromApp.current.keys.add(k);
+      if (line) {
+        const ours = fromApp.current.lines;
+        const before = new Set(ours.keys());
+        ours.set(line, [...(ours.get(line) ?? []), ...(code ? [code] : [])]);
+        setDraft((d) => withLine(d, line, before));
+      }
+      requestAnimationFrame(() => {
+        const box = document.getElementById("composer");
+        if (!(box instanceof HTMLTextAreaElement)) return;
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      });
+    };
+  });
+  // (Not in a workspace shared with the user: pictures stay on this Mac there.)
+  useEffect(() => (listen && !state.shared ? listen(c.id, (files, line, code) => receive.current(files, line, code)) : undefined), [listen, c.id, state.shared]);
   const filePicker = useRef<HTMLInputElement>(null);
   const [dropping, setDropping] = useState(false);
   // What went wrong with the mic, shown under the composer for a few seconds.
@@ -338,7 +529,26 @@ export function ChatView({
   const send = async () => {
     const text = draft.trim();
     if (!text && !attaching.length) return;
+    // In a shared workspace (the viewer has Write on every bot here): their words go to the owner's Bops through
+    // Bops Cloud (shared-act.ts), shown as theirs at once. Pictures stay on this Mac (view-only.ts uploads).
+    if (state.shared) {
+      if (attaching.length || !text) return setMicError("Pictures can't be sent in a shared workspace.");
+      setDraft("");
+      setReplying(null);
+      const mine = { id: `pending_${Date.now()}`, chatId: c.id, text, at: Date.now() };
+      setPending((p) => [...p, mine]);
+      setSent((x) => [...x.slice(-19), { chatId: c.id, text, at: mine.at }]);
+      const r = await memberAct({ act: "chat", chatId: c.id, text, ...(replying ? { replyTo: replying.id } : {}) });
+      setPending((p) => p.filter((x) => x.id !== mine.id));
+      if (!r.ok && r.error) setMicError(r.error);
+      return;
+    }
     const items = attaching;
+    // Anything Select or Draw put here, still in it: the message is about the app (and Select's lines still in it
+    // take their code along, lib/app-preview.ts picksOf).
+    const picks = [...fromApp.current.lines].filter(([l]) => text.includes(l)).flatMap(([line, codes]) => codes.map((code) => ({ line, code })));
+    const aboutApp = items.some((a) => fromApp.current.keys.has(a.key)) || [...fromApp.current.lines.keys()].some((l) => text.includes(l));
+    fromApp.current = { keys: new Set(), lines: new Map() };
     // Every preview in the tray (the failed ones too), let go once the pending copy showing them has gone.
     const previews = attach.items.map((a) => a.preview);
     setDraft("");
@@ -354,7 +564,10 @@ export function ChatView({
     // Shows at once; goes once its images have finished uploading (usually they already have).
     const images = (await Promise.all(items.map((a) => a.done))).filter((x) => !!x);
     if (!text && !images.length) return drop();
-    await post(`/api/chats/${encodeURIComponent(c.id)}/messages`, { text, replyTo: replying?.id, images: images.length ? images : undefined }).finally(drop);
+    // Only a pick the bot can run now goes; one that can't anymore is let go (boxAgents).
+    const pick = solo && agentPicks[c.id] ? boxAgents(state, solo, agentPicks[c.id], boxKeys).picked?.id : undefined;
+    if (agentPicks[c.id] && !pick) dropPick();
+    await post(`/api/chats/${encodeURIComponent(c.id)}/messages`, { text, replyTo: replying?.id, images: images.length ? images : undefined, lookingAt: looking?.id, ...(pick ? { agent: pick } : {}), ...(aboutApp ? { appNote: true } : {}), ...(picks.length ? { picks } : {}) }).finally(drop);
   };
   const filesOf = (d: DataTransfer | null) => [...(d?.files ?? [])].filter((f) => f.type.startsWith("image/"));
   // Sent messages the server's state doesn't have yet.
@@ -392,16 +605,20 @@ export function ChatView({
       ? `Working on ${running.length} thing${running.length === 1 ? "" : "s"}`
       : solo
         ? solo.role
-        : members.map((m) => m.name).join(", ") + " and you";
+        : // A shared workspace's chats are its owner's: the viewer isn't in them.
+          members.map((m) => m.name).join(", ") + (state.shared ? "" : " and you");
 
   const width = wide ? "mx-auto w-full max-w-[680px]" : "";
+  // A delete's line: one message's where it was (before the first message shown after it), more over the message box.
+  const deletedHere = linesFor(deletes.gone, c.id, visible);
 
   return (
     <PairOpen.Provider value={(id, focus) => setPair({ id, focus })}>
     <main
       className="relative flex min-h-0 min-w-0 flex-1 flex-col border-r border-[#ECECEA] bg-white"
       onDragOver={(e) => {
-        if (![...e.dataTransfer.types].includes("Files")) return;
+        // Nothing's sent in a shared workspace, so it takes no images (the window refuses them: bops-app.tsx).
+        if (state.shared || ![...e.dataTransfer.types].includes("Files")) return;
         e.preventDefault();
         if (!dropping) setDropping(true);
       }}
@@ -409,6 +626,7 @@ export function ChatView({
       onDrop={(e) => {
         e.preventDefault();
         setDropping(false);
+        if (state.shared) return;
         const files = filesOf(e.dataTransfer);
         if (files.length) {
           attach.add(files);
@@ -424,16 +642,27 @@ export function ChatView({
       {pair && <PairSheet state={state} pairId={pair.id} focusId={pair.focus} onClose={() => setPair(null)} />}
       {saving && <SaveSkillDialog botId={saving.botId} chatId={saving.chatId} onClose={closeSaving} />}
       <div className="absolute right-5 top-[18px] z-10 flex items-center gap-2">
-        {/* The chat's own menu (a bot's chat, like Call): Save as skill rereads this chat for how the bot did a job. */}
-        {solo && !call && (
+        {/* The chat's own menu (a bot's chat, like Call): Save as skill rereads this chat for how the bot did a job.
+            Neither in a shared workspace: its bots are the owner's to call and teach. */}
+        {/* A group's has Compact, Select messages and Delete all messages only. A shared workspace's, Compact alone, for a member with Write. */}
+        {(solo ? !call : messages.length > 0) && (!state.shared || mayCompact) && (
           <MoreMenu
             key={c.id}
             label="More"
             size="chat"
-            items={[{ label: "Save as skill", icon: <SkillIcon />, onClick: () => setSaving({ botId: solo.id, chatId: c.id }) }]}
+            items={[
+              ...(solo && !state.shared ? [{ label: "Save as skill", icon: <SkillIcon />, onClick: () => setSaving({ botId: solo.id, chatId: c.id }) }] : []),
+              ...(mayCompact ? [{ label: "Compact", icon: <CompactIcon />, off: compactOff ?? undefined, onClick: () => void compact() }] : []),
+              ...(messages.length && !state.shared
+                ? [
+                    { label: "Select messages", icon: <SelectIcon />, onClick: () => (setClearing(null), setSelecting({ chat: c.id, ids: [] })) },
+                    { label: "Delete all messages", icon: <TrashIcon />, danger: true, onClick: () => (setSelecting(null), setClearing(c.id)) },
+                  ]
+                : []),
+            ]}
           />
         )}
-        {solo && !call && (
+        {solo && !call && !state.shared && (
           <button
             onClick={() => onCall(solo.id)}
             aria-label={`Call ${solo.name}`}
@@ -467,50 +696,93 @@ export function ChatView({
                 <span className="text-[14px] font-semibold leading-[18px]">{chatName(c, state.bots)}</span>
                 <span className="text-[12px] leading-[15px] text-[#9A9A98]">{status}</span>
               </div>
+              {solo && !state.shared && <PreviewButton state={state} botId={solo.id} />}
             </>
           )}
         </header>
         <div className={`flex flex-1 flex-col justify-end gap-1.5 px-5 pb-9 pt-8 ${width}`}>
-          {messages.length === 0 && (
-            <div className="m-auto max-w-[300px] py-10 text-center text-[14px] leading-5 text-[#6B6B6B]">
-              {solo
-                ? solo.isMain
-                  ? teamOf(state).length > 1
-                    ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
-                    : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
-                  : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
-                : "Say hi to the group. @mention a bot to point at it."}
+          {/* An empty chat invites whoever can start it (the owner, or a teammate with Write on its bot) and offers a first ask. */}
+          {messages.length === 0 && (!state.shared || (!!solo && state.shared.levels?.[solo.id] === "write")) && (
+            <div className="m-auto flex max-w-[360px] flex-col items-center gap-3 py-10 text-center">
+              {solo && <Mascot botId={solo.id} color={solo.color} size={64} live chatId={c.id} />}
+              <p className="text-[14px] leading-5 text-[#6B6B6B]">
+                {solo
+                  ? solo.isMain
+                    ? teamOf(state).length > 1
+                      ? `Text ${solo.name} anything. ${solo.name} hands work to the right bot and keeps you posted.`
+                      : `Text ${solo.name} anything. ${solo.name} works on its own computer, and can build you a team of bots when you need one.`
+                    : `Text ${solo.name} directly. Long tasks show up here as threads you can open.`
+                  : "Say hi to the group. @mention a bot to point at it."}
+              </p>
+              {solo && (
+                <div className="mt-1 flex w-full flex-col gap-2">
+                  {(solo.isMain ? ["What is everyone working on?", "Help me onboard a new client", "What can this team do for me?"] : ["What can you do?", "Show me your latest work", "What do you need from me?"]).map((ask) => (
+                    <button
+                      key={ask}
+                      onClick={() => {
+                        setDraft(ask);
+                        requestAnimationFrame(() => document.getElementById("composer")?.focus());
+                      }}
+                      className="flex items-center justify-between rounded-full bg-white px-4 py-2.5 text-left text-[14px] leading-5 text-ink shadow-[0_0_0_1px_#E2E2DF] transition-colors duration-100 hover:bg-[#F7F7F6] active:scale-[0.98]"
+                    >
+                      {ask}
+                      <span aria-hidden className="text-[#9A9A98]">→</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
-          {hiddenCount > 0 && (
-            <button onClick={() => setShown((n) => n + PAGE)} className="mb-2 self-center rounded-full px-3 py-1 text-[12.5px] font-medium text-[#6B6B6B] shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] hover:text-ink">
+          {(hiddenCount > 0 || olderThere) && (
+            <button onClick={showEarlier} className="mb-2 self-center rounded-full px-3 py-1 text-[12.5px] font-medium text-[#6B6B6B] shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] hover:text-ink">
               Show earlier messages
             </button>
           )}
           {visible.map((m, i) => {
             const prev = i === 0 ? messages[hiddenCount - 1] : visible[i - 1];
             const gap = !prev || m.at - prev.at > 15 * 60_000;
+            const row = (
+              <MessageRow
+                m={m}
+                state={state}
+                showSender={c.kind === "group" || (!!m.botId && m.botId !== solo?.id)}
+                continued={!!prev && prev.role === m.role && prev.botId === m.botId && prev.member?.userId === m.member?.userId && !gap}
+                sessionById={sessionById}
+                chipIds={chipsFor(m)}
+                onOpenThread={onOpenThread}
+                onShowScreen={onShowScreen}
+                arrival={arrivalOf(m)}
+                {...rowProps(m)}
+              />
+            );
             return (
               <Fragment key={m.id}>
+                {deletedHere.before.get(m.id)?.map((g) => <UndoLine key={g.key} g={g} onUndo={() => void deletes.undo(g.key)} className={g.mine ? "self-end" : "self-start"} />)}
                 {gap && <div className={`self-center py-1.5 text-[12px] leading-4 text-[#9A9A98] ${seen.has(m.id) ? "" : "motion-rise-in"}`}>{dayTime(m.at)}</div>}
-                <MessageRow
-                  m={m}
-                  state={state}
-                  showSender={c.kind === "group" || (!!m.botId && m.botId !== solo?.id)}
-                  continued={!!prev && prev.role === m.role && prev.botId === m.botId && !gap}
-                  sessionById={sessionById}
-                  chipIds={chipsFor(m)}
-                  onOpenThread={onOpenThread}
-                  onShowScreen={onShowScreen}
-                  arrival={arrivalOf(m)}
-                  {...rowProps(m)}
-                />
+                {ticking && rowShown(m, state) ? (
+                  <TickRow on={ticked.has(m.id)} onToggle={() => tick(m.id)}>
+                    {row}
+                  </TickRow>
+                ) : (
+                  row
+                )}
                 {i + hiddenCount === lastUserIdx && repliedAfterUser && (
-                  <div className={`self-end px-1 pb-1 text-[11px] leading-[14px] text-[#9A9A98] ${readBy && !seen.has(readBy.id) ? "motion-fade-in" : ""}`}>Read {clockTime(m.at)}</div>
+                  <div className={`${saidBy(m, state) === "you" ? "self-end px-1" : "self-start pl-3"} pb-1 text-[11px] leading-[14px] text-[#9A9A98] ${readBy && !seen.has(readBy.id) ? "motion-fade-in" : ""}`}>Read {clockTime(m.at)}</div>
                 )}
               </Fragment>
             );
           })}
+          {deletedHere.after.map((g) => (
+            <UndoLine key={g.key} g={g} onUndo={() => void deletes.undo(g.key)} className={g.mine ? "self-end" : "self-start"} />
+          ))}
+          {compactingHere &&
+            (compactingHere.error ? (
+              <span role="alert" className="self-center py-1 text-[12px] leading-4 text-[#B42318]">
+                {compactingHere.error}
+              </span>
+            ) : (
+              <CompactRule label="Compacting…" />
+            ))}
           {waiting.map((p) => (
             // Up from the composer as you send it (not again when you come back to the chat before it lands).
             <div key={p.id} className={`flex max-w-[86%] flex-col items-end gap-1 self-end ${seen.has(p.id) ? "" : "motion-send-in"}`}>
@@ -533,7 +805,8 @@ export function ChatView({
                   </span>
                 )}
               <div className="flex items-end gap-2">
-                {c.kind === "group" && tb && <Mascot botId={tb.id} color={tb.color} size={24} />}
+                {/* Its mascot beside the dots thinks (or writes, when a thread of its is writing), in a group or 1:1. */}
+                {tb && <Mascot botId={tb.id} color={tb.color} size={24} live chatId={c.id} />}
                 <div className="flex items-center gap-[5px] rounded-[18px] bg-[#F2F2F0] px-4 py-[13px]">
                   {/* A wave, each dot 150 ms behind the last. The delays are a whole 1.2 s wave early, so
                       no dot sits dark and still before its turn comes. */}
@@ -554,30 +827,49 @@ export function ChatView({
             <div className="absolute inset-0 backdrop-blur-[6px] [mask-image:linear-gradient(to_top,black_30%,transparent_75%)]" />
               <div className="absolute inset-0 bg-gradient-to-t from-white from-45% via-white/80 via-75% to-white/0" />
             </div>
-          {state.credits?.out && <OutOfCredit onUpgrade={onUpgrade} />}
+          {/* The viewer's own credit, which a shared workspace's bots (the owner's) don't run on. */}
+          {state.credits?.out && !state.shared && <OutOfCredit onUpgrade={onUpgrade} />}
           {(appAsks.length > 0 || threadAsks.length > 0) && (
             <div className="mb-2.5 flex max-h-[45vh] flex-col gap-2 overflow-y-auto">
+              {/* A shared workspace's asks are the owner's to answer, but for a bot the viewer has at Write: shown, answered only then. */}
+              <div className="contents">
               {shownAsks.map((x) => (
+                <OwnerOnly key={x.id} only={!writesThread(state, x) || (!!state.shared && askKind(x) === "elsewhere")}>
                 <NeedsYouCard
                   key={x.id}
                   session={x}
                   state={state}
                   quote
                   pinned
-                  onShow={() => (x.display ?? x.lastDisplay) !== undefined ? onShowScreen(x.botId, (x.display ?? x.lastDisplay)!) : onOpenThread(x)}
+                  onShow={() => (x.display ?? x.lastDisplay) !== undefined ? onShowScreen(x.botId, (x.display ?? x.lastDisplay)!, x.id) : onOpenThread(x)}
                   onShowScreen={onShowScreen}
                   onSomethingElse={() => onOpenThread(x)}
                   onOpen={() => onOpenThread(x)}
                 />
+                </OwnerOnly>
               ))}
               {threadAsks.length > shownAsks.length && (
                 <button onClick={() => setAllAsks(true)} className="self-start pl-1 text-[12px] font-medium leading-4 text-[#6B6B6B] hover:text-ink">
-                  {threadAsks.length - shownAsks.length} more waiting on you
+                  {/* (In a shared workspace some are the viewer's to answer, with Write: just how many more.) */}
+                  {threadAsks.length - shownAsks.length} more waiting{state.shared ? "" : ` on ${ownerYou(state)}`}
                 </button>
               )}
               {appAsks.map((a) => (
-                <AppApprovalCard key={a.id} state={state} approval={a} className={seen.has(a.id) ? "" : "motion-rise-in"} />
+                <OwnerOnly key={a.id} only={!answersAsk(state, a)}>
+                  <AppApprovalCard state={state} approval={a} className={seen.has(a.id) ? "" : "motion-rise-in"} />
+                </OwnerOnly>
               ))}
+              </div>
+            </div>
+          )}
+          {/* Several deleted at once, or the whole chat: their line, with Undo while it can come back. */}
+          {deletedHere.over.map((g) => (
+            <UndoLine key={g.key} g={g} onUndo={() => void deletes.undo(g.key)} className="mb-1.5 self-center" />
+          ))}
+          {/* The app open beside the chat, which what's said is about (made-apps.tsx); its X takes it off. */}
+          {looking && (
+            <div className="flex px-1 pb-2">
+              <LookingAt app={looking} onClear={() => setNotLooking(looking.id)} />
             </div>
           )}
           {/* Folds open over the composer. Keyed by chat, so switching chats shows it as it is there, with
@@ -589,7 +881,7 @@ export function ChatView({
                 <div className="mx-2 -mb-px flex items-center gap-2 rounded-t-[16px] bg-[#F7F7F6] px-3.5 py-2 shadow-[0_0_0_1px_#ECECEA]">
                   <ReplyArrow />
                   <span className="min-w-0 flex-1 truncate text-[12.5px] leading-4 text-[#6B6B6B]">
-                    Replying to <span className="font-medium text-ink">{bar.role === "user" ? "yourself" : (state.bots.find((x) => x.id === bar.botId)?.name ?? "the bot")}</span>
+                    Replying to <span className="font-medium text-ink">{bar.role === "user" ? repliedToWho(bar, state) : (state.bots.find((x) => x.id === bar.botId)?.name ?? "the bot")}</span>
                     {" · "}
                     {bar.text}
                   </span>
@@ -603,15 +895,44 @@ export function ChatView({
             )}
           </Fold>
 
+          {picked && solo && !readOnly(state, c.botIds) && <div className="px-3 pb-1.5 text-[12px] leading-4 text-[#6B6B6B]">{pickLine(picked, solo, state)}</div>}
+          {readOnly(state, c.botIds) ? (
+            <ReadOnlyLine state={state} botIds={c.botIds} />
+          ) : ticking ? (
+            <TickBar
+              count={ticked.size}
+              onCancel={() => setSelecting(null)}
+              onDelete={() => {
+                const going = messages.filter((m) => ticked.has(m.id));
+                setSelecting(null);
+                deletes.remove(c.id, going, { mine: going.length === 1 && saidBy(going[0], state) === "you" });
+              }}
+            />
+          ) : askingClear ? (
+            <AskInPlace
+              danger
+              focus="cancel"
+              title={`Delete all ${num(messages.length)} message${messages.length === 1 ? "" : "s"} in this chat?`}
+              line={`${keptDays ? `You can restore them from Recently deleted for ${keptDays} days.` : "It can't be undone."} Knowledge keeps what it learned from them.`}
+              action="Delete"
+              onConfirm={() => {
+                setClearing(null);
+                deletes.remove(c.id, messages, { all: true, count: messages.length });
+              }}
+              onCancel={() => setClearing(null)}
+            />
+          ) : (
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void send();
             }}
-            className="flex flex-col rounded-[22px] bg-white py-2 pl-2 pr-2 shadow-[0_0_0_1px_#E2E2DF]"
+            className={`flex flex-col rounded-[22px] bg-white py-2 ${state.shared ? "pl-4" : "pl-2"} pr-2 shadow-[0_0_0_1px_#E2E2DF]`}
           >
             <AttachmentTray items={attach.items} onRemove={attach.remove} />
             <div className="flex items-end gap-2">
+            {/* No pictures in a shared workspace: they'd stay on this Mac (view-only.ts uploads). */}
+            {!state.shared && (
             <button
               type="button"
               onClick={() => filePicker.current?.click()}
@@ -623,6 +944,7 @@ export function ChatView({
                 <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
               </svg>
             </button>
+            )}
             <input
               ref={filePicker}
               type="file"
@@ -641,7 +963,7 @@ export function ChatView({
               onChange={setDraft}
               onPaste={(e) => {
                 const files = filesOf(e.clipboardData);
-                if (!files.length) return;
+                if (!files.length || state.shared) return;
                 e.preventDefault();
                 attach.add(files);
               }}
@@ -649,6 +971,8 @@ export function ChatView({
               placeholder={replying ? "Reply" : solo ? `Text ${solo.name}` : "Message the group · @ to mention"}
               className="min-w-0 flex-1 bg-transparent py-[6px] text-[14px] leading-[18px] outline-none placeholder:text-[#9A9A98]"
             />
+            {/* The mic's words are read by the app's own server: not while a shared workspace is open (view-only.ts). */}
+            {!state.shared && (
             <MicButton
               botId={solo?.id}
               onError={setMicError}
@@ -658,11 +982,29 @@ export function ChatView({
                 document.getElementById("composer")?.focus();
               }}
             />
+            )}
+            {solo && !state.shared && (
+              <AgentChipPick
+                state={state}
+                bot={solo}
+                keys={boxKeys}
+                value={picked?.id ?? null}
+                onPick={(id) =>
+                  setAgentPicks((p) => {
+                    const next = { ...p };
+                    if (id) next[c.id] = id;
+                    else delete next[c.id];
+                    return next;
+                  })
+                }
+              />
+            )}
             <button type="submit" aria-label="Send" disabled={!draft.trim() && !attaching.length} className="flex size-[30px] shrink-0 items-center justify-center rounded-full bg-ink disabled:opacity-30">
               <SendIcon />
             </button>
             </div>
           </form>
+          )}
           {micError && <div className="px-3 pt-1.5 text-[12px] leading-4 text-[#B42318]">{micError}</div>}
         </div>
       </div>
@@ -678,7 +1020,7 @@ export function ChatView({
             repliesShown = null;
             setRepliesOpen(null);
           }}
-          onSend={(text) => post(`/api/chats/${encodeURIComponent(c.id)}/messages`, { text, replyTo: openReplies })}
+          onSend={(text) => (state.shared ? memberAct({ act: "chat", chatId: c.id, text, replyTo: openReplies }) : post(`/api/chats/${encodeURIComponent(c.id)}/messages`, { text, replyTo: openReplies }))}
           rowProps={rowProps}
           sessionById={sessionById}
           onOpenThread={onOpenThread}
@@ -689,6 +1031,27 @@ export function ChatView({
     </PairOpen.Provider>
   );
 }
+
+/**
+ * Where the lines of a chat's deletes go (message-deletes.tsx): one message's before the first message shown
+ * that came after it, or after them all; several deleted at once, or the whole chat, over the message box.
+ */
+function linesFor(gone: readonly Gone[], chatId: string, shown: readonly Message[]) {
+  const before = new Map<string, Gone[]>();
+  const here = gone.filter((g) => g.chatId === chatId);
+  const one = here.filter((g) => g.one).sort((a, b) => a.at - b.at);
+  let j = 0;
+  for (const m of shown) {
+    while (j < one.length && one[j].at <= m.at) {
+      before.set(m.id, [...(before.get(m.id) ?? []), one[j]]);
+      j++;
+    }
+  }
+  return { before, after: one.slice(j), over: here.filter((g) => !g.one) };
+}
+
+/** Whether a message draws anything (MessageRow): a CRM note where the CRM isn't open, or an app's line where apps aren't shown, doesn't, so Select messages offers no ring for it. */
+const rowShown = (m: Message, state: AppState) => !(m.role === "system" && ((m.crm && !crmOpen(state)) || (m.madeApp && !appsOwnShown(state))));
 
 /** The replies sheet showing last: coming back to its chat shows it in place, without its entrance again (closing it clears this). */
 let repliesShown: string | null = null;
@@ -715,7 +1078,7 @@ function RepliesView({
   showSender: boolean;
   onClose: () => void;
   onSend: (text: string) => Promise<unknown>;
-  rowProps: (m: Message) => Pick<RowProps, "replyCount" | "root" | "onReply" | "onOpenReplies" | "onShowMac">;
+  rowProps: (m: Message) => Pick<RowProps, "replyCount" | "root" | "onReply" | "onOpenReplies" | "onShowMac" | "onDelete">;
   sessionById: (id: string) => Session | undefined;
   onOpenThread: (s: Session) => void;
   onShowScreen: (botId: string, display: number) => void;
@@ -727,6 +1090,8 @@ function RepliesView({
     end.current?.scrollIntoView({ block: "end" });
   }, [list.length]);
   const typing = state.chats.find((x) => x.id === list[0]?.chatId)?.typing ?? [];
+  // Its chat's bots: in a shared workspace, replied in only with Write on every one (lib/shared.ts readOnly).
+  const botIds = state.chats.find((x) => x.id === list[0]?.chatId)?.botIds ?? [];
   // What was here when it opened just shows; a reply that comes in while it's open moves in, and
   // yours (sent from here, with nothing pending before it) goes up from the composer.
   const [seen] = useState(() => new Set(list.map((m) => m.id)));
@@ -772,6 +1137,9 @@ function RepliesView({
           {typing.length > 0 && <span className="self-start pl-1 text-[12px] text-[#9A9A98]">{typing.map((t) => state.bots.find((b) => b.id === t)?.name).join(", ")} typing…</span>}
           <div ref={end} />
         </div>
+        {readOnly(state, botIds) ? (
+          <ReadOnlyLine state={state} botIds={botIds} className="m-3 mt-0" />
+        ) : (
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -794,6 +1162,7 @@ function RepliesView({
             <SendIcon />
           </button>
         </form>
+        )}
       </div>
     </div>
   );
@@ -807,7 +1176,7 @@ const MENU_ITEM = "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 tex
  * Call) and a thread's (next to Stop). A click outside or Esc closes it; Esc closes only it, not the
  * sheet or page under it.
  */
-function MoreMenu({ label, size, items }: { label: string; size: "chat" | "sheet"; items: { label: string; icon: React.ReactNode; onClick: () => void }[] }) {
+function MoreMenu({ label, size, items }: { label: string; size: "chat" | "sheet"; items: { label: string; icon: React.ReactNode; onClick: () => void; danger?: boolean; /** Why it can't go now: shown off, with this as its tip. */ off?: string }[] }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -848,11 +1217,13 @@ function MoreMenu({ label, size, items }: { label: string; size: "chat" | "sheet
               <button
                 key={x.label}
                 role="menuitem"
+                disabled={!!x.off}
+                title={x.off}
                 onClick={() => {
                   setOpen(false);
                   x.onClick();
                 }}
-                className={MENU_ITEM}
+                className={`${x.danger ? `${MENU_ITEM} text-[#B42318] hover:bg-[#FEF3F2]` : MENU_ITEM} disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent`}
               >
                 {x.icon}
                 {x.label}
@@ -860,6 +1231,65 @@ function MoreMenu({ label, size, items }: { label: string; size: "chat" | "sheet
             ))}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+/** "Compact": lines drawn together. */
+function CompactIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" className="shrink-0 text-[#6B6B6B]" aria-hidden>
+      <path d="M2.5 8h11M5.5 2.5L8 5l2.5-2.5M5.5 13.5L8 11l2.5 2.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/** What a Compact that didn't go says, when Bops said nothing more. */
+const DIDNT_COMPACT = "That didn't compact. Try again.";
+
+/** A Compact's answer from the app's own route: ok, or what it said went wrong. */
+async function answered(res: Promise<Response>): Promise<{ ok: boolean; error?: string }> {
+  const r = await res.catch(() => null);
+  if (!r) return { ok: false, error: "Couldn't reach Bops. Try again." };
+  if (r.ok) return { ok: true };
+  return { ok: false, error: ((await r.json().catch(() => ({}))) as { error?: string }).error || DIDNT_COMPACT };
+}
+
+/** A quiet rule across the chat with a few words in its middle (Compact's line, and while one is on its way). */
+function CompactRule({ label, children }: { label: string; children?: React.ReactNode }) {
+  return (
+    <div className="flex w-full items-center gap-3 py-1.5">
+      <span aria-hidden className="h-px flex-1 bg-[#ECECEA]" />
+      {children ?? <span className="text-[12px] leading-4 text-[#9A9A98]">{label}</span>}
+      <span aria-hidden className="h-px flex-1 bg-[#ECECEA]" />
+    </div>
+  );
+}
+
+/**
+ * Compact's line in a chat (Message.compacted): "Compacted" and when, on a quiet rule. The chat's bots read it afresh
+ * from here, after its summary (Chat.summary), which pressing the line shows as it is now. Only the owner's window has
+ * the summary: a shared workspace's member sees the line alone (cloud/ws-slice.ts).
+ */
+function CompactedLine({ m, state, className = "" }: { m: Message; state: AppState; className?: string }) {
+  const [open, setOpen] = useState(false);
+  const summary = state.shared ? undefined : state.chats.find((c) => c.id === m.chatId)?.summary;
+  const by = m.member ? ` by ${state.shared?.you === m.member.userId ? "you" : m.member.name}` : "";
+  const label = `Compacted${by} · ${dayTime(m.at)}`;
+  return (
+    <div className={`flex w-full flex-col items-center gap-1.5 ${className}`}>
+      <CompactRule label={label}>
+        {summary && (
+          <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} title={open ? "Hide the summary" : "Show the summary"} className="text-[12px] leading-4 text-[#9A9A98] hover:text-ink">
+            {label}
+          </button>
+        )}
+      </CompactRule>
+      {open && summary && (
+        <div className="w-full max-w-[520px] whitespace-pre-wrap rounded-[14px] bg-[#F7F7F6] px-3.5 py-2.5 text-[13px] leading-[19px] text-[#3A3A38] [overflow-wrap:anywhere]">
+          {summary.text || (summary.rebuild ? "Writing the summary again." : "Nothing in it now.")}
+        </div>
       )}
     </div>
   );
@@ -917,6 +1347,8 @@ type RowProps = {
   root?: Message;
   onReply: () => void;
   onOpenReplies: () => void;
+  /** Delete it (its hover actions, its menu): to Recently deleted, with a line offering Undo (message-deletes.tsx). None in a shared workspace. */
+  onDelete?: () => void;
   /** Drawn inside the replies view: no quote or count, they'd say what's already on screen. */
   inReplies?: boolean;
   /** New since the chat opened, and how it moves in (undefined: it was already here, so it just shows). */
@@ -958,11 +1390,34 @@ function lasts(all: Message[]) {
   return v;
 }
 
-function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onOpenThread, onShowScreen, onShowMac, replyCount, root, onReply, onOpenReplies, inReplies, arrival }: RowProps) {
+/**
+ * How one of the viewer's own words in a shared workspace stands until the owner's Bops has written it
+ * (Message.memberSend, ThreadReply.memberSend): on its way, waiting for the owner's Bops to open, or not sent,
+ * with why and Try again (the same act, by its key: it's never done twice).
+ */
+function MemberSendLine({ send, retry }: { send: NonNullable<Message["memberSend"]>; retry: (key: string) => void }) {
+  return (
+    <span className={`px-1 text-[11.5px] leading-4 ${send.state === "failed" ? "text-[#B42318]" : "text-[#9A9A98]"}`}>
+      {send.state === "sending" ? "Sending…" : send.state === "waiting" ? "Waiting for the owner's Bops to open." : (send.error ?? "That didn't go.")}
+      {send.state === "failed" && (
+        <button onClick={() => retry(send.key)} className="ml-1.5 font-medium underline-offset-2 hover:underline">
+          Try again
+        </button>
+      )}
+    </span>
+  );
+}
+
+function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onOpenThread, onShowScreen, onShowMac, replyCount, root, onReply, onOpenReplies, onDelete, inReplies, arrival }: RowProps) {
   // Decided once, as the row mounts: a poll or a new tapback draws it again but never replays it.
   // Yours carries on its pending copy's motion (a negative delay starts it partway, or past the end).
   const [enter] = useState(() =>
-    !arrival ? undefined : arrival.kind === "send" ? { className: "motion-send-in", style: arrival.since ? { animationDelay: `${arrival.since - Date.now()}ms` } : undefined } : { className: "motion-rise-in", style: undefined },
+    !arrival
+      ? undefined
+      : arrival.kind === "send"
+        ? { className: "motion-send-in", style: arrival.since ? { animationDelay: `${arrival.since - Date.now()}ms` } : undefined }
+        : // A bot's reply arrives whole, with an entrance of its own; anything else that comes in rises in.
+          { className: m.role === "bot" ? "motion-reply-in" : "motion-rise-in", style: undefined },
   );
   const enterClass = enter?.className ?? "";
   // What was already here when the row mounted sits still: its tapbacks.
@@ -986,7 +1441,15 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
     onPointerUp: () => press.current && clearTimeout(press.current),
     onPointerLeave: () => press.current && clearTimeout(press.current),
   };
-  const outgoing = m.role === "user";
+  // A shared workspace's messages are the owner's: read and copied, never reacted to or deleted here; replied to
+  // only where the viewer has Write on every bot in the chat (canAct).
+  const ro = !!state.shared;
+  const writes = canAct(state, state.chats.find((x) => x.id === m.chatId)?.botIds ?? []);
+  // The user's own words go out on the right. In a workspace shared with them the owner's come in on the left,
+  // named as the owner's, never in the viewer's own outgoing bubble; and so does a member's (someone the owner
+  // gave Write, Message.member), named as theirs, in the owner's own window too.
+  const said = saidBy(m, state);
+  const outgoing = said === "you";
   // The bot's latest message can offer replies as buttons (see ASKING); tapping one sends it.
   const newest = lasts(state.messages).byChat.get(m.chatId) === m.id;
   const mine = m.reactions?.find((r) => r.by === "owner");
@@ -996,7 +1459,11 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
     const same = r && mine && (r.type ? mine.type === r.type : mine.emoji === r.emoji);
     void post(`/api/chats/${encodeURIComponent(m.chatId)}/messages`, { id: m.id, reaction: same ? null : r }, "PATCH");
   };
-  const nameOf = (by: string | undefined) => (by === "owner" ? "You" : (state.bots.find((x) => x.id === by)?.name ?? "A bot"));
+  // In a shared workspace the owner's words are theirs, never the user's.
+  const you = ownerWho(state.shared);
+  // Who's named over words that come in on the left: the owner's, or a member's by name.
+  const sender = said && typeof said === "object" ? said.name : you;
+  const nameOf = (by: string | undefined) => (by === "owner" ? you : (state.bots.find((x) => x.id === by)?.name ?? "A bot"));
 
   // Tapbacks sit on the bubble's top corner, away from its sender, like Messages: yours blue, the bots' gray.
   const balloons = !!m.reactions?.length && (
@@ -1007,15 +1474,16 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
     >
       {m.reactions.slice(-3).map((r, i) => (
         <span key={r.by} className="pointer-events-auto" style={{ marginLeft: outgoing && i ? -8 : 0, marginRight: !outgoing && i ? -8 : 0 }}>
-          <TapbackBalloon reaction={r.type} emoji={r.emoji} own={r.by === "owner"} side={outgoing ? "left" : "right"} platform="macos" animateIn={!reactedAtMount.has(reactionKey(r))} />
+          <TapbackBalloon reaction={r.type} emoji={r.emoji} own={isViewerOwn(r.by, state)} side={outgoing ? "left" : "right"} platform="macos" animateIn={!reactedAtMount.has(reactionKey(r))} />
         </span>
       ))}
     </span>
   );
 
-  // Hovering a message: react, reply, delete. The picker opens above the bubble.
+  // Hovering a message: react, reply, copy, delete. The picker opens above the bubble.
   const actions = (
     <span className={`flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/msg:opacity-100 ${picking ? "opacity-100" : ""} ${outgoing ? "flex-row-reverse" : ""}`}>
+      {!ro && (
       <button onClick={() => setPicking(!picking)} aria-label="React" title="React" className="flex size-6 items-center justify-center rounded-md text-[#9A9A98] hover:bg-black/[0.05] hover:text-ink">
         <svg width="14" height="14" viewBox="0 0 16 16">
           <circle cx="7.5" cy="8.5" r="5.8" fill="none" stroke="currentColor" strokeWidth="1.3" />
@@ -1024,12 +1492,12 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           <circle cx="9.4" cy="7" r=".8" fill="currentColor" />
         </svg>
       </button>
-      {!inReplies && (
+      )}
+      {!inReplies && (!ro || writes) && (
         <button onClick={onReply} aria-label="Reply" title="Reply" className="flex size-6 items-center justify-center rounded-md text-[#9A9A98] hover:bg-black/[0.05] hover:text-ink">
           <ReplyArrow />
         </button>
       )}
-      {/* Copy on hover; deleting is in the right-click menu. */}
       <button
         onClick={() => {
           void navigator.clipboard.writeText(m.text);
@@ -1050,6 +1518,12 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </svg>
         )}
       </button>
+      {/* Delete: to Recently deleted, no question asked; its line in place offers Undo (message-deletes.tsx). */}
+      {!ro && onDelete && (
+        <button onClick={onDelete} aria-label="Delete" title="Delete" className="flex size-6 items-center justify-center rounded-md text-[#9A9A98] hover:bg-[#FEF3F2] hover:text-[#B42318]">
+          <TrashIcon />
+        </button>
+      )}
     </span>
   );
   const close = () => {
@@ -1060,7 +1534,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
   // Both open out of the bubble's corner they hang from: right for yours, left for the bot's.
   const actionMenu = menu && (
     <div className={`motion-menu-in absolute top-[calc(100%+6px)] z-40 flex w-[168px] flex-col rounded-xl bg-white p-1 shadow-[0_0_0_1px_#0000000F,0_12px_30px_-10px_#00000040] ${outgoing ? "right-0 origin-top-right" : "left-0 origin-top-left"}`}>
-      {!inReplies && (
+      {!inReplies && (!ro || writes) && (
         <button
           onClick={() => {
             close();
@@ -1085,23 +1559,24 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
         </svg>
         Copy
       </button>
+      {!ro && onDelete && (
       <button
         onClick={() => {
           close();
-          void post(`/api/chats/${encodeURIComponent(m.chatId)}/messages`, { id: m.id }, "DELETE");
+          onDelete();
         }}
         className={`${menuItem} text-[#B42318] hover:bg-[#FEF3F2]`}
       >
-        <svg width="13" height="13" viewBox="0 0 16 16" className="shrink-0">
-          <path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
-        </svg>
+        <TrashIcon />
         Delete
       </button>
+      )}
     </div>
   );
   const picker = (picking || menu) && (
     <>
       <div className="fixed inset-0 z-30" onClick={close} onContextMenu={(e) => (e.preventDefault(), close())} />
+      {!ro && (
       <div
         className={`motion-menu-in absolute bottom-[calc(100%+6px)] z-40 flex items-center gap-0.5 rounded-full bg-white px-1.5 py-1 shadow-[0_0_0_1px_#0000000F,0_12px_30px_-10px_#00000040] ${outgoing ? "right-0 origin-bottom-right" : "left-0 origin-bottom-left"}`}
       >
@@ -1117,6 +1592,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </button>
         ))}
       </div>
+      )}
     </>
   );
   // A reply quotes what it answers; the message replied to says how many replies it has.
@@ -1124,7 +1600,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
     <button onClick={onOpenReplies} className={`flex max-w-full items-center gap-1.5 px-1 text-[11.5px] leading-4 text-[#9A9A98] hover:text-[#6B6B6B] ${outgoing ? "self-end" : "self-start"}`}>
       <ReplyArrow />
       <span className="truncate">
-        {root.role === "user" ? "You" : nameOf(root.botId)}: {root.text}
+        {root.role === "user" ? (root.member ? (saidBy(root, state) === "you" ? "You" : root.member.name) : you) : nameOf(root.botId)}: {root.text}
       </span>
     </button>
   );
@@ -1143,7 +1619,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
   const latest = m.watch && lasts(state.messages).byWatch.get(m.watch.id) === m.id;
   const watch = latest ? state.watches?.find((w) => w.id === m.watch!.id) : undefined;
   const page = watch?.page;
-  const watchActions = watch && page ? (
+  const watchActions = ro ? null : watch && page ? (
     <div className="flex gap-1.5 pl-0.5">
       <button
         onClick={(e) => {
@@ -1216,15 +1692,17 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </Fragment>
         );
       })}
-      {runningHere.length > 1 && (
+      {runningHere.length > 1 && (!ro || canAct(state, [...new Set(runningHere.map((s) => s.botId))])) && (
         <button
-          onClick={() => runningHere.forEach((s) => void post("/api/sessions", { sessionId: s.id }, "DELETE"))}
+          // In a shared workspace: one act for all of them (at most MEMBER_STOP_MAX), each bot's at Write.
+          onClick={() => (ro ? void memberAct({ act: "stop", sessionIds: runningHere.slice(0, MEMBER_STOP_MAX).map((s) => s.id) }) : runningHere.forEach((s) => void post("/api/sessions", { sessionId: s.id }, "DELETE")))}
           className="pl-1 text-[12px] font-medium leading-4 text-[#9A9A98] hover:text-[#B42318]"
         >
-          Stop all {runningHere.length}
+          {/* (Only as many as one Stop sends from a shared workspace: the rest stay, with Stop all again for them.) */}
+          Stop all {ro ? Math.min(runningHere.length, MEMBER_STOP_MAX) : runningHere.length}
         </button>
       )}
-      {chips
+      {!ro && chips
         .filter((s) => s.askWhere && live(s))
         .map((s) => (
           <div key={`${s.id}-where`} className="flex gap-1.5 pl-1">
@@ -1239,7 +1717,7 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </div>
         ))}
       {/* The bot (or someone's words) suggested the Mac, but the user didn't ask: nothing moves until they say so (sessions.ts offerMove). Only while it runs (once it's over, a move would do it all again), and not while its card above offers Try on your Mac. */}
-      {chips
+      {!ro && chips
         .filter((s) => s.offerMac && live(s) && s.runsOn !== "mac" && state.mac?.ready && !(needsYou(s) && (s.blocker || s.status === "failed")))
         .map((s) => (
           <div key={`${s.id}-move`} className="flex gap-1.5 pl-1">
@@ -1257,23 +1735,27 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
 
   if (m.role === "user")
     return (
-      <div className={`group/msg flex max-w-[78%] flex-col items-end gap-1 self-end ${enterClass}`} style={enter?.style}>
+      <div className={`group/msg flex max-w-[78%] flex-col gap-1 ${outgoing ? "items-end self-end" : "items-start self-start"} ${enterClass}`} style={enter?.style}>
+        {!outgoing && !continued && <div className="pl-3 text-[11px] leading-[14px] text-[#9A9A98]">{sender}</div>}
         {quote}
         {/* Room above the bubble for its tapbacks, so they don't cover the quote or sender line (it eases open as the first one pops in). */}
         <div className={`flex min-w-0 max-w-full items-center gap-1 transition-[margin] duration-200 ease-out motion-reduce:transition-none ${m.reactions?.length ? "mt-3.5" : ""}`}>
-          {actions}
+          {outgoing && actions}
           <div className="relative min-w-0" {...holdable}>
             {picker}
             {actionMenu}
             {balloons}
-            <div className="flex flex-col items-end gap-1">
-              {!!m.images?.length && <MessageImages images={m.images} />}
-              {m.text && <div className="select-text whitespace-pre-wrap rounded-[18px] bg-ink px-3.5 py-2 text-[14px] leading-5 text-white [overflow-wrap:anywhere]">{m.text}</div>}
+            <div className={`flex flex-col gap-1 ${outgoing ? "items-end" : "items-start"}`}>
+              {!!m.images?.length && <MessageImages images={m.images} align={outgoing ? "end" : "start"} />}
+              {m.text && (
+                <div className={`select-text whitespace-pre-wrap rounded-[18px] px-3.5 py-2 text-[14px] leading-5 [overflow-wrap:anywhere] ${outgoing ? "bg-ink text-white" : "bg-white text-ink shadow-[0_0_0_1px_#E2E2DF]"}`}>{m.text}</div>
+              )}
             </div>
           </div>
+          {!outgoing && actions}
         </div>
         {m.via === "sms" && (
-          <span data-tip="You texted this from your phone; the answer goes back by text" className="flex items-center gap-1 pr-1 text-[11.5px] leading-4 text-[#9A9A98]">
+          <span data-tip={`${you} texted this from ${state.shared ? "their" : "your"} phone; the answer goes back by text`} className={`flex items-center gap-1 text-[11.5px] leading-4 text-[#9A9A98] ${outgoing ? "pr-1" : "pl-1"}`}>
             <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden className="shrink-0">
               <rect x="4.2" y="1.5" width="7.6" height="13" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.3" />
               <path d="M7 12.2h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
@@ -1282,12 +1764,13 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </span>
         )}
         {m.via && m.via !== "sms" && (
-          <span data-tip={`You sent this in ${CHANNEL_NAME[m.via]}; the answer went back there`} className="flex items-center gap-1 pr-1 text-[11.5px] leading-4 text-[#9A9A98]">
+          <span data-tip={`${you} sent this in ${CHANNEL_NAME[m.via]}; the answer went back there`} className={`flex items-center gap-1 text-[11.5px] leading-4 text-[#9A9A98] ${outgoing ? "pr-1" : "pl-1"}`}>
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={`/logos/${m.via}.svg`} alt="" width={11} height={11} className="shrink-0 rounded-[3px] opacity-80" />
             via {CHANNEL_NAME[m.via]}
           </span>
         )}
+        {m.memberSend && <MemberSendLine send={m.memberSend} retry={(key) => void memberAct({ act: "chat", chatId: m.chatId, text: m.text, ...(m.replyTo ? { replyTo: m.replyTo } : {}) }, key)} />}
         {replies}
         {chipList}
       </div>
@@ -1296,14 +1779,15 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
   // A text or call to the bot's number from someone else.
   if (m.role === "system" && m.sms) return <TextCard m={m} state={state} className={enterClass} />;
 
-  // A call shows as a bubble from you in the bot's color, like a call in Messages.
+  // A call shows as a bubble from you in the bot's color, like a call in Messages. The owner's, in a
+  // workspace shared with the user, comes in on the left, named as theirs.
   if (m.call) {
     const caller = state.bots.find((x) => `bot:${x.id}` === m.chatId);
     const fill = !caller || caller.isMain ? "#0A0A0A" : caller.color;
     const mins = Math.floor(m.call.seconds / 60);
-    return (
+    const bubble = (
       <div
-        className={`flex items-center gap-2 self-end rounded-[18px] px-3.5 py-2 text-[14px] leading-5 ${enterClass}`}
+        className={`flex items-center gap-2 rounded-[18px] px-3.5 py-2 text-[14px] leading-5 ${ro ? "self-start" : `self-end ${enterClass}`}`}
         style={{ background: fill, color: readableOn(fill) }}
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round">
@@ -1313,23 +1797,50 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
         {m.call.seconds % 60}s · {m.call.phone ? "Phone call" : "Call"} ended
       </div>
     );
+    return ro ? (
+      <div className={`flex flex-col items-start gap-1 self-start ${enterClass}`}>
+        <div className="pl-3 text-[11px] leading-[14px] text-[#9A9A98]">{you}</div>
+        {bubble}
+      </div>
+    ) : (
+      bubble
+    );
   }
 
   if (m.role === "system" && m.email) return <EmailCard m={m} state={state} className={enterClass} />;
 
-  // Something just remembered rises in with the soft wash Orbit gives what it learns.
-  if (m.role === "system" && m.memory) return <MemoryNote m={m} className={enter ? "motion-new-item" : ""} />;
+  // Compact's line: where the chat's bots read it afresh from, after its summary.
+  if (m.role === "system" && m.compacted) return <CompactedLine m={m} state={state} className={enterClass} />;
 
-  // A bot's save to the CRM: Open the file, or Undo it (only where the CRM is open: lib/crm-access.ts).
-  // CrmNote takes no class, so a new one rises in inside a box that leaves its own alignment as it was.
+  // Something just remembered rises in with the soft wash Orbit gives what it learns.
+  // In a workspace shared with the user it's the owner's memory: shown, nothing to undo or forget (readOnly).
+  if (m.role === "system" && m.memory) return <MemoryNote m={m} readOnly={ro} className={enter ? "motion-new-item" : ""} />;
+
+  // A bot's save to the CRM: Open the file, or Undo it (only where the CRM is open: lib/crm-access.ts; and
+  // neither in a workspace shared with the user, whose CRM is the owner's). CrmNote takes no class, so a new
+  // one rises in inside a box that leaves its own alignment as it was.
   if (m.role === "system" && m.crm)
     return crmOpen(state) ? (
       enter ? (
         <div className={`flex w-full flex-col ${enterClass}`}>
-          <CrmNote m={m} />
+          <CrmNote m={m} readOnly={ro} />
         </div>
       ) : (
-        <CrmNote m={m} />
+        <CrmNote m={m} readOnly={ro} />
+      )
+    ) : null;
+
+  // A bot building or changing an app: Show it, Open it, or Undo the change (made-apps.tsx). Like
+  // CrmNote, a new one rises in inside a box that leaves its own alignment as it was. Only where apps
+  // are shown (lib/apps-access.ts): anyone else's line from before isn't there at all.
+  if (m.role === "system" && m.madeApp)
+    return appsOwnShown(state) ? (
+      enter ? (
+        <div className={`flex w-full flex-col ${enterClass}`}>
+          <MadeAppLine m={m} state={state} />
+        </div>
+      ) : (
+        <MadeAppLine m={m} state={state} />
       )
     ) : null;
 
@@ -1362,23 +1873,32 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
             <div className="flex flex-col items-start gap-1">
               {/* Pictures the bot made (make_image). */}
               {!!m.images?.length && <MessageImages images={m.images} align="start" />}
-              {(m.text || !m.images?.length) && (
-                <div className="whitespace-pre-wrap rounded-[18px] bg-[#F2F2F0] px-3.5 py-2 text-[14px] leading-5 [overflow-wrap:anywhere]">
-                  <Rich text={withoutBriefing(m.text)} botId={m.botId} />
-                </div>
+              {/* What a task changed in one of the owner's apps (app-change.tsx), in place of its words, which an older Bops shows. */}
+              {m.appChange && appsOwnShown(state) ? (
+                <AppChangeCard m={m} state={state} />
+              ) : (
+                (m.text || !m.images?.length) && (
+                  <div className="whitespace-pre-wrap rounded-[18px] bg-[#F2F2F0] px-3.5 py-2 text-[14px] leading-5 [overflow-wrap:anywhere]">
+                    <Rich text={withoutBriefing(m.text)} botId={m.botId} />
+                  </div>
+                )
               )}
             </div>
           </div>
           {actions}
         </div>
+        {/* Replies it wrote for the user to send, each a card with Send (read only in a shared workspace). */}
+        <ReplyDrafts message={m} state={state} />
+        {/* Changes it proposed to a skill, each a card with Accept and Reject (read only in a shared workspace). */}
+        <SkillProposals message={m} state={state} />
         {replies}
-        {m.needed && m.resultOf && <AnsweredLine message={m} session={sessionById(m.resultOf)} />}
-        {newest && !!m.options?.length && (
+        {m.needed && m.resultOf && <AnsweredLine message={m} session={sessionById(m.resultOf)} state={state} />}
+        {newest && (!ro || writes) && !!m.options?.length && (
           <div className="flex flex-wrap gap-1.5 pt-0.5">
             {m.options.map((o) => (
               <button
                 key={o}
-                onClick={() => void post(`/api/chats/${encodeURIComponent(m.chatId)}/messages`, { text: o })}
+                onClick={() => void (ro ? memberAct({ act: "chat", chatId: m.chatId, text: o }) : post(`/api/chats/${encodeURIComponent(m.chatId)}/messages`, { text: o }))}
                 className="rounded-full bg-white px-3 py-1.5 text-[13px] font-medium leading-4 shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]"
               >
                 {o}
@@ -1387,12 +1907,12 @@ function MessageRow({ m, state, showSender, continued, sessionById, chipIds, onO
           </div>
         )}
         {m.emailed && (
-          <span data-tip={`Also sent to ${m.emailed}, as a reply to your email`} className="flex items-center gap-1 pl-3 text-[11.5px] leading-4 text-[#9A9A98]">
+          <span data-tip={`Also sent to ${m.emailed}, as a reply to ${state.shared ? "their" : "your"} email`} className="flex items-center gap-1 pl-3 text-[11.5px] leading-4 text-[#9A9A98]">
             <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden className="shrink-0">
               <rect x="1.8" y="3.2" width="12.4" height="9.6" rx="2" fill="none" stroke="currentColor" strokeWidth="1.3" />
               <path d="M2.5 4.5 8 8.6l5.5-4.1" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
             </svg>
-            Emailed to you
+            Emailed to {ownerYou(state)}
           </span>
         )}
         {watchActions}
@@ -1443,7 +1963,7 @@ const nameColor = (b: Bot) => (b.isMain || /^#0[0-9a-f]{5}$/i.test(b.color) ? "#
  * the chat: both of them in the header, each message under its sender's name in its color, a time
  * between exchanges, and Close chat. Opens at the exchange it was opened from.
  */
-function PairSheet({ state, pairId, focusId, onClose }: { state: AppState; pairId: string; focusId?: string; onClose: () => void }) {
+export function PairSheet({ state, pairId, focusId, onClose }: { state: AppState; pairId: string; focusId?: string; onClose: () => void }) {
   const bots = pairId
     .slice(5)
     .split(":")
@@ -1451,13 +1971,20 @@ function PairSheet({ state, pairId, focusId, onClose }: { state: AppState; pairI
     .filter(Boolean) as Bot[];
   const messages = state.messages.filter((m) => m.chatId === pairId);
   const list = useRef<HTMLDivElement>(null);
+  // In a shared workspace Bops Cloud may have older messages of it than the window (lib/server/shared-core.ts
+  // SharedCopy.older): a page more is read while the exchange it was opened at isn't here yet, and on Show earlier messages.
+  const olderThere = !!state.shared?.more?.includes(pairId);
+  const found = !focusId || messages.some((m) => m.id === focusId);
+  useEffect(() => {
+    if (olderThere && !found) void post("/api/workspaces/shared", { older: pairId });
+  }, [olderThere, found, pairId, messages.length]);
   useLayoutEffect(() => {
     const el = list.current;
     if (!el) return;
     const target = focusId ? el.querySelector<HTMLElement>(`[data-msg="${focusId}"]`) : null;
     if (target) target.scrollIntoView({ block: "center" });
     else el.scrollTop = el.scrollHeight;
-  }, [focusId]);
+  }, [focusId, found]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -1466,7 +1993,7 @@ function PairSheet({ state, pairId, focusId, onClose }: { state: AppState; pairI
   const label = (b: Bot) => `${b.name} · ${b.isMain ? "Chief of Staff" : b.role}`;
   return (
     // A dialog: Esc closes it before the Vault or a profile on the right (see bops-app.tsx).
-    <div role="dialog" aria-label="Chat between your bots" className="absolute inset-0 z-40 flex animate-[screen-in_200ms_ease-out] flex-col bg-white">
+    <div role="dialog" aria-label={`Chat between ${state.shared ? "the owner's" : "your"} bots`} className="absolute inset-0 z-40 flex animate-[screen-in_200ms_ease-out] flex-col bg-white">
       <div className="flex shrink-0 justify-center px-5 pb-2 pt-4">
         <div className="flex max-w-full items-center gap-2.5 rounded-full py-1.5 pl-1.5 pr-4 shadow-[0_0_0_1px_#ECECEA]">
           {bots.map((b, i) => (
@@ -1485,6 +2012,11 @@ function PairSheet({ state, pairId, focusId, onClose }: { state: AppState; pairI
         </div>
       </div>
       <div ref={list} className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto px-5 pb-24 pt-4">
+        {olderThere && (
+          <button onClick={() => void post("/api/workspaces/shared", { older: pairId })} className="mb-2 self-center rounded-full px-3 py-1 text-[12.5px] font-medium text-[#6B6B6B] shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] hover:text-ink">
+            Show earlier messages
+          </button>
+        )}
         {messages.length === 0 && <div className="m-auto text-[13.5px] text-[#9A9A98]">Nothing between them yet.</div>}
         {messages.map((m, i) => {
           const b = state.bots.find((x) => x.id === m.botId);
@@ -1580,7 +2112,7 @@ function EmailCard({ m, state, className = "" }: { m: Message; state: AppState; 
   const b = state.bots.find((x) => `bot:${x.id}` === m.chatId);
   const from = person(e.from);
   const long = m.text.length > 280 || m.text.split("\n").length > 4;
-  const label = e.dir === "in" ? (e.fromOwner ? `You emailed ${b?.name ?? "the bot"}` : `Email to ${b?.name ?? "the bot"}`) : `${b?.name ?? "The bot"} sent an email`;
+  const label = e.dir === "in" ? (e.fromOwner ? `${ownerWho(state.shared)} emailed ${b?.name ?? "the bot"}` : `Email to ${b?.name ?? "the bot"}`) : `${b?.name ?? "The bot"} sent an email`;
   return (
     <div className={`flex w-full max-w-[460px] flex-col gap-1.5 self-start ${e.bulk ? "opacity-75" : ""} ${className}`}>
       <div className="flex items-center gap-1.5 pl-1 text-[11.5px] leading-4 text-[#9A9A98]">
@@ -1652,7 +2184,8 @@ function SystemNote({ text }: { text: string }) {
   );
 }
 
-function MemoryNote({ m, className = "" }: { m: Message; className?: string }) {
+/** Something a bot remembered, with Undo (and Forget old for what it replaced): neither when `readOnly` (a shared workspace's, its owner's memory). */
+function MemoryNote({ m, readOnly = false, className = "" }: { m: Message; readOnly?: boolean; className?: string }) {
   const mem = m.memory!;
   const [busy, setBusy] = useState(false);
   const act = (action: "undo" | "forget-old") => {
@@ -1672,7 +2205,7 @@ function MemoryNote({ m, className = "" }: { m: Message; className?: string }) {
             {mem.fact}
           </span>
         </div>
-        {!mem.undone && (
+        {!mem.undone && !readOnly && (
           <button disabled={busy} onClick={() => act("undo")} className={button}>
             Undo
           </button>
@@ -1687,9 +2220,11 @@ function MemoryNote({ m, className = "" }: { m: Message; className?: string }) {
               <span className="min-w-0 flex-1 truncate text-[#9A9A98]" title={mem.old.text}>
                 Replaces: {mem.old.text}
               </span>
-              <button disabled={busy} onClick={() => act("forget-old")} className={button}>
-                Forget old
-              </button>
+              {!readOnly && (
+                <button disabled={busy} onClick={() => act("forget-old")} className={button}>
+                  Forget old
+                </button>
+              )}
             </>
           )}
         </div>
@@ -1709,33 +2244,43 @@ function readableOn(hex: string) {
 function SessionChip({ session: s, state, onClick }: { session: Session; state: AppState; onClick: () => void }) {
   const b = state.bots.find((x) => x.id === s.botId);
   const waiting = needsYou(s);
+  // In a shared workspace, what it waits on is the viewer's to answer too (Write on its bot): said so, not "the owner".
+  const theirs = memberAnswers(state, s);
   const badge = threadBadge(s, state);
+  const mark = BRAINS_ON && (badge || (s.agent && s.agent.kind !== "bops") || (b && hasProfile(b, state) && aiOf(b, state).agents.some((x) => isCli(x.kind)))) ? threadKind(s) : undefined;
+  const agentWords = threadAgentWords(s, b, state);
   return (
     <button
       onClick={onClick}
       className="flex max-w-full items-center gap-[9px] rounded-[14px] bg-white py-[9px] pl-3 pr-3.5 text-left shadow-[0_0_0_1px_#E6E6E3] hover:shadow-[0_0_0_1px_#C9C9C6]"
     >
-      <StatusIcon session={s} size={14} dark />
+      <StatusIcon session={s} size={14} dark owner={!!state.shared && !theirs} member={theirs} okWait={waitsForOk(s, state)} />
+      {/* The agent that runs it (lib/agents.ts): its mark before the title, where its bot runs more than Bops agent,
+          titled with how it pays ("Claude Code · Opus 5.5 · your Max plan"), and named for a screen reader. */}
+      {mark && (
+        <span title={[agentWords.label, agentWords.pays, badge?.kind === "agent" ? badge.title : ""].filter(Boolean).join(" · ")} className="flex shrink-0">
+          <AgentMark kind={mark} size={14} />
+          <span className="sr-only">{agentWords.label}: </span>
+        </span>
+      )}
       <span className={`truncate text-[14px] leading-[18px] ${live(s) || waiting ? "text-ink" : "text-[#6B6B6B]"}`}>{s.title}</span>
-      {/* The brain that runs it, when one does (threadRunner); Bops agent only where its bot is on a brain now. */}
-      {badge && <BrainBadge kind={badge.kind} title={badge.title} />}
-      {/* Where it runs: the user's Mac or the cloud (deciding: nothing yet). */}
+      {/* Where it runs: the user's Mac (the owner's, in a shared workspace) or the cloud (deciding: nothing yet). */}
       {s.runsOn === "mac" ? (
-        <span title="On your Mac" className="flex shrink-0 items-center gap-1 rounded-full bg-[#F2F2F0] px-1.5 py-px text-[11px] leading-[14px] text-[#3A3A38]">
+        <span title={`On ${state.shared ? "the owner's" : "your"} Mac`} className="flex shrink-0 items-center gap-1 rounded-full bg-[#F2F2F0] px-1.5 py-px text-[11px] leading-[14px] text-[#3A3A38]">
           <MacIcon size={11} />
-          Your Mac
+          {ownerMac(state)}
         </span>
       ) : s.askWhere && live(s) ? (
         <span className="shrink-0 text-[12px] leading-4 text-[#6B6B6B]">· where?</span>
       ) : null}
-      {waiting && <span className="shrink-0 text-[12px] leading-4 text-[#6B6B6B]">· {s.blocker ? `needs ${BLOCKER_ASK[s.blocker]}` : "needs you"}</span>}
+      {waiting && <span className="shrink-0 text-[12px] leading-4 text-[#6B6B6B]">· {s.blocker ? `needs ${blockerAsk(state, s.blocker)}` : theirs ? "needs an answer" : `needs ${ownerYou(state)}`}</span>}
       {/* Which screen it's on, live: the number on the panel's tiles. */}
       {live(s) && s.runsOn !== "mac" && s.display !== undefined && (
         <span title={`On screen ${screenNo(s.display)} of ${b?.name ?? "its bot"}'s computer`} className="shrink-0 rounded-full bg-[#F2F2F0] px-1.5 py-px text-[11px] tabular-nums leading-[14px] text-[#3A3A38]">
           Screen {screenNo(s.display)}
         </span>
       )}
-      {b && s.sentVia !== "you" && s.chatId !== `bot:${b.id}` && <span className="shrink-0 text-[12px] leading-4 text-[#9A9A98]">· {b.name}</span>}
+      {b && !ownerSent(s) && s.chatId !== `bot:${b.id}` && <span className="shrink-0 text-[12px] leading-4 text-[#9A9A98]">· {b.name}</span>}
     </button>
   );
 }
@@ -1745,7 +2290,7 @@ function SessionChip({ session: s, state, onClick }: { session: Session; state: 
 type Line =
   | { kind: "note"; at: number; text: string }
   | { kind: "steps"; at: number; steps: { tool: string; detail: string; who?: string; screen?: number }[] }
-  | { kind: "reply"; at: number; role: "user" | "bot"; text: string }
+  | { kind: "reply"; at: number; role: "user" | "bot"; text: string; member?: ThreadReply["member"]; memberSend?: ThreadReply["memberSend"] }
   | { kind: "event"; at: number; text: string };
 
 /** Build the thread's transcript: narration as prose, tool steps folded, replies in order. */
@@ -1753,7 +2298,9 @@ function timeline(s: Session): Line[] {
   const lines: Line[] = [];
   for (const st of s.steps) {
     if (st.tool === "setup") continue;
-    if (st.tool === "note") lines.push({ kind: "note", at: st.at, text: st.who ? `${st.who}: ${st.detail}` : st.detail });
+    // Compact's line (sessions.ts compactThread): quiet, with when.
+    if (st.tool === COMPACTED) lines.push({ kind: "event", at: st.at, text: `${st.detail} · ${dayTime(st.at)}` });
+    else if (st.tool === "note") lines.push({ kind: "note", at: st.at, text: st.who ? `${st.who}: ${st.detail}` : st.detail });
     else {
       const last = lines[lines.length - 1];
       if (last?.kind === "steps") last.steps.push(st);
@@ -1762,7 +2309,7 @@ function timeline(s: Session): Line[] {
   }
   // Passed on from outside Bops (someone's email): shown as that, not as the user's words.
   for (const r of s.replies)
-    lines.push(r.note ? { kind: "event", at: r.at, text: r.note } : r.from ? { kind: "event", at: r.at, text: `Passed on from ${r.from}: ${r.text}` } : { kind: "reply", at: r.at, role: r.role, text: r.text });
+    lines.push(r.note ? { kind: "event", at: r.at, text: r.note } : r.from ? { kind: "event", at: r.at, text: `Passed on from ${r.from}: ${r.text}` } : { kind: "reply", at: r.at, role: r.role, text: r.text, ...(r.member ? { member: r.member } : {}), ...(r.memberSend ? { memberSend: r.memberSend } : {}) });
   if (!s.replies.length && s.answer) lines.push({ kind: "reply", at: s.endedAt ?? Date.now(), role: "bot", text: s.answer });
   return lines.sort((a, b) => a.at - b.at);
 }
@@ -1785,8 +2332,8 @@ export function ThreadSheet({
   session: Session;
   onClose: () => void;
   onShowComputer: () => void;
-  /** Show one of a bot's screens up close: where its brain's sign-in opened (NeedsYouCard). */
-  onShowScreen?: (botId: string, display: number) => void;
+  /** Show one of a bot's screens up close: where its brain's sign-in opened, or the thread's own, for it (NeedsYouCard). */
+  onShowScreen?: (botId: string, display: number, sessionId?: string) => void;
 }) {
   // "Working for 1m 23s" counts up while it's open.
   useNow(live(s) ? 1000 : 60_000);
@@ -1811,7 +2358,8 @@ export function ThreadSheet({
   const closeSaving = useCallback(() => setSaving(null), []);
   const end = useRef<HTMLDivElement>(null);
   const b = state.bots.find((x) => x.id === s.botId)!;
-  const via = s.sentVia === "routine" ? undefined : s.sentVia === "you" ? b : state.bots.find((x) => x.id === s.sentVia);
+  // Sent via the bot itself when the user gave it; else the bot that handed it on (a bot from before named You too: ownerSent).
+  const via = routineSent(s) ? undefined : ownerSent(s) ? b : state.bots.find((x) => x.id === s.sentVia);
   // The routine whose run this is, while it's there (Session.routineId).
   const routine = s.routineId ? state.routines.find((r) => r.id === s.routineId) : undefined;
   const lines = timeline(s);
@@ -1823,7 +2371,14 @@ export function ThreadSheet({
   const runner = threadRunner(s);
   const badge = threadBadge(s, state);
   const terminal = state.takeover?.terminal && state.takeover.sessionId === s.id ? state.takeover.display : undefined;
-  const canTerminal = runner === "claude" && brainOf(b, state)?.id === s.brainRun?.brainId && s.runsOn !== "mac" && state.host !== "mac" && terminal === undefined && !!onShowScreen;
+  // Any CLI agent's thread its bot still runs on that account (lib/agents.ts threadAgent).
+  const now = BRAINS_ON && runner && runner !== "agent" ? threadAgent(s, b, state) : undefined;
+  const canTerminal = !!now && isCli(now.kind) && !now.gone && (now.account?.id ?? "-") === s.brainRun?.brainId && s.runsOn !== "mac" && state.host !== "mac" && terminal === undefined && !!onShowScreen;
+  // The agent it runs on, for its header: its mark, model and how it pays (a line of its own under the title).
+  const kindNow = threadKind(s);
+  const shownAgent = BRAINS_ON && (kindNow !== "bops" || !!badge || !!s.agent) ? { kind: kindNow, model: s.agent?.kind === kindNow ? s.agent.model : undefined } : undefined;
+  const agentWords = threadAgentWords(s, b, state);
+  const agentPays = shownAgent && agentWords.pays ? upper(agentWords.pays) : undefined;
   const [termBusy, setTermBusy] = useState(false);
   const [termError, setTermError] = useState<{ id: string; text: string } | null>(null);
   const toTerminal = async () => {
@@ -1838,35 +2393,51 @@ export function ThreadSheet({
     end.current?.scrollIntoView({ block: "end" });
   }, [lines.length, s.status]);
 
+  // In a shared workspace (the viewer has Write on its bot), through Bops Cloud to the owner's Bops (shared-act.ts).
+  const writes = canAct(state, [s.botId]);
+  // Compact (its menu): its brain folds what it has so far, now, where it takes the ask (lib/types.ts threadCompacts), as
+  // replying in it takes. Off while it runs, or with nothing said since the last one.
+  const compacts = threadCompacts(s) && writesThread(state, s);
+  const [compactError, setCompactError] = useState<{ id: string; text: string } | null>(null);
+  const compact = async () => {
+    const r = state.shared ? await memberAct({ act: "compact", sessionId: s.id }) : await answered(post(`/api/sessions/${s.id}/compact`));
+    setCompactError(r.ok ? null : { id: s.id, text: r.error || DIDNT_COMPACT });
+  };
+  // Why a Stop from a shared workspace didn't go (it shows Stop again, with this under the header).
+  const [stopError, setStopError] = useState<string | null>(null);
   const send = async () => {
     const text = draft.trim();
     if (!text) return;
     setDraft("");
-    await post(`/api/sessions/${s.id}/reply`, { text });
+    if (state.shared) await memberAct({ act: "reply", sessionId: s.id, text });
+    else await post(`/api/sessions/${s.id}/reply`, { text });
   };
 
   return (
     // Clicking anywhere outside the sheet closes it, like the × does. Opening, the scrim fades in
     // (its blur stays as it is) and the sheet comes up from below.
     <div onClick={onClose} className={`absolute inset-0 z-20 flex flex-col bg-white/70 px-3 pb-3 pt-[52px] backdrop-blur-[2px] ${opening ? "motion-fade-in" : ""}`}>
-      <div onClick={(e) => e.stopPropagation()} className={`flex min-h-0 flex-1 flex-col overflow-hidden rounded-[28px] bg-white shadow-[0_0_0_1px_#0000000F,0_24px_60px_-20px_#00000038] ${opening ? "motion-sheet-in" : ""}`}>
-        {/* Portalled over everything; inside the card, so its clicks never reach the scrim and close the sheet. */}
+      <div onClick={(e) => e.stopPropagation()} className={`relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[28px] bg-white shadow-[0_0_0_1px_#0000000F,0_24px_60px_-20px_#00000038] ${opening ? "motion-sheet-in" : ""}`}>
+        {/* In place of the thread, inside its card, so its clicks never reach the scrim and close the sheet. */}
         {saving === s.id && <SaveSkillDialog botId={s.botId} chatId={s.chatId} sessionId={s.id} onClose={closeSaving} />}
         <div className="flex items-center gap-2.5 border-b border-[#F0F0EE] py-3.5 pl-4 pr-3.5">
           <Mascot botId={b.id} color={b.color} size={32} />
           <div className="flex min-w-0 flex-1 flex-col gap-px">
             <div className="flex min-w-0 items-center gap-1.5">
               <span className="truncate text-[15px] font-semibold leading-[18px]">{s.title}</span>
-              {badge && <BrainBadge kind={badge.kind} title={badge.title} />}
+              {shownAgent ? <AgentChip agent={shownAgent} label={agentWords.label} title={[agentWords.label, agentWords.pays, badge?.kind === "agent" ? badge.title : ""].filter(Boolean).join(" · ")} /> : badge && <BrainBadge kind={badge.kind} title={badge.title} />}
             </div>
+            {agentPays && <span className="text-[12px] leading-4 text-[#6B6B6B]">{agentPays}</span>}
             <button onClick={onShowComputer} className="flex items-center gap-1.5 text-left text-[12px] leading-4 text-[#6B6B6B] hover:text-ink">
-              {b.name} · {s.runsOn === "mac" ? "on your Mac · " : ""}
-              {terminal !== undefined ? "in the terminal" : s.askWhere && live(s) ? "waiting for you" : live(s) ? "working" : s.status === "done" ? "finished" : "stopped"} · {toolCount} steps
+              {b.name} · {s.runsOn === "mac" ? `on ${state.shared ? "the owner's" : "your"} Mac · ` : ""}
+              {terminal !== undefined ? "in the terminal" : s.askWhere && live(s) ? `waiting for ${ownerYou(state)}` : live(s) ? "working" : s.status === "done" ? "finished" : "stopped"} · {toolCount} steps
               {/* Its screen, by the number the panel and the bots use. */}
               {s.runsOn !== "mac" && (live(s) && s.display !== undefined ? ` · screen ${screenNo(s.display)}` : !live(s) && s.lastDisplay !== undefined ? ` · left off on screen ${screenNo(s.lastDisplay)}` : "")}
             </button>
           </div>
-          {s.runsOn !== "mac" && state.mac?.ready && (s.blocker || s.status === "failed" || (s.offerMac && live(s))) && (
+          {/* A shared workspace's thread is the owner's: nothing here moves, stops, deletes or saves it. */}
+          {/* Not for a run waiting for your OK: its card answers it where it runs. */}
+          {!state.shared && s.runsOn !== "mac" && state.mac?.ready && !waitsForOk(s, state) && (s.blocker || s.status === "failed" || (s.offerMac && live(s))) && (
             <button
               onClick={() => void post(`/api/sessions/${s.id}/where`, { move: true })}
               title="Do this on your Mac instead, on your home internet"
@@ -1876,17 +2447,24 @@ export function ThreadSheet({
               {s.offerMac && live(s) && !s.blocker ? "Move to your Mac" : "Try on your Mac"}
             </button>
           )}
-          {canTerminal && (
+          {canTerminal && !state.shared && (
             <button
               disabled={termBusy}
               onClick={() => void toTerminal()}
-              title={live(s) ? "Pause it and work with Claude Code yourself, in a terminal on its screen" : "Work with Claude Code yourself, in a terminal on its screen"}
+              title={live(s) ? `Pause it and work with ${AGENTS[kindNow].name} yourself, in a terminal on its screen` : `Work with ${AGENTS[kindNow].name} yourself, in a terminal on its screen`}
               className="shrink-0 rounded-full px-3 py-1.5 text-[13px] font-medium shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] disabled:opacity-50"
             >
               Open in terminal
             </button>
           )}
-          {live(s) ? (
+          {/* Stop for a viewer with Write on its bot (through the owner's Bops); deleting stays the owner's. */}
+          {state.shared ? (
+            writes && live(s) && (
+              <button disabled={!!s.stopAsked} onClick={() => void memberAct({ act: "stop", sessionIds: [s.id] }).then((r) => setStopError(r.ok ? null : (r.error ?? "That didn't go. Try again.")))} className="rounded-full px-3 py-1.5 text-[13px] font-medium shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] disabled:opacity-50">
+                {s.stopAsked ? "Stopping" : "Stop"}
+              </button>
+            )
+          ) : live(s) ? (
             <button onClick={() => void post("/api/sessions", { sessionId: s.id }, "DELETE")} className="rounded-full px-3 py-1.5 text-[13px] font-medium shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6]">
               Stop
             </button>
@@ -1902,19 +2480,40 @@ export function ThreadSheet({
             </button>
           )}
           {/* Save as skill: the bot rereads this thread for how it did the job. Keyed by thread, so another one's sheet starts it shut. */}
-          <MoreMenu key={s.id} label="More" size="sheet" items={[{ label: "Save as skill", icon: <SkillIcon />, onClick: () => setSaving(s.id) }]} />
+          {/* Compact, where its brain takes it: a shared workspace's member with Write sees that alone. */}
+          {(!state.shared || compacts) && (
+            <MoreMenu
+              key={s.id}
+              label="More"
+              size="sheet"
+              items={[
+                ...(state.shared ? [] : [{ label: "Save as skill", icon: <SkillIcon />, onClick: () => setSaving(s.id) }]),
+                ...(compacts ? [{ label: "Compact", icon: <CompactIcon />, off: threadCompactBlocked(s) ?? undefined, onClick: () => void compact() }] : []),
+              ]}
+            />
+          )}
           <button onClick={onClose} aria-label="Close thread" className="flex size-[34px] items-center justify-center rounded-full shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6]">
             <svg width="12" height="12" viewBox="0 0 12 12">
               <path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="#0A0A0A" strokeWidth="1.6" strokeLinecap="round" />
             </svg>
           </button>
         </div>
+        {stopError && (
+          <span role="alert" className="border-b border-[#F0F0EE] px-4 py-2 text-[12px] leading-4 text-[#B42318]">
+            {stopError}
+          </span>
+        )}
+        {compactError?.id === s.id && (
+          <span role="alert" className="border-b border-[#F0F0EE] px-4 py-2 text-[12px] leading-4 text-[#B42318]">
+            {compactError.text}
+          </span>
+        )}
 
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-[18px] pb-3 pt-4">
           <div className="flex w-[86%] flex-col items-end gap-1.5 self-end">
             <div className="flex items-center gap-1.5 text-[12px] leading-4 text-[#6B6B6B]">
               {via && <Mascot botId={via.id} color={via.color} size={16} antenna={false} />}
-              {s.sentVia === "routine" ? (routine ? `Sent by a routine · ${undash(routine.title)}` : "Sent by a routine") : `Sent via ${via?.name ?? "the main bot"}`}
+              {routineSent(s) ? (routine ? `Sent by a routine · ${undash(routine.title)}` : "Sent by a routine") : s.member ? `Asked by ${state.shared?.you === s.member.userId ? "you" : s.member.name}` : `Sent via ${via?.name ?? "the main bot"}`}
             </div>
             <div className="flex flex-col gap-2 rounded-[18px] bg-[#FBFFE0] px-[15px] pb-2.5 pt-[11px] shadow-[0_0_0_1px_#EEF7A8]">
               <div className={`whitespace-pre-wrap text-[14px] leading-[21px] ${expanded ? "" : "line-clamp-3"}`}>{s.goal}</div>
@@ -1934,11 +2533,11 @@ export function ThreadSheet({
             {s.askWhere && live(s) && (
               <div className="flex flex-col gap-2 rounded-[14px] bg-[#FBFFD9] px-3.5 py-3 shadow-[0_0_0_1px_#E8F28A]">
                 <span className="text-[13.5px] font-medium leading-[18px]">Where should {b.name} do this?</span>
-                <span className="text-[12.5px] leading-[17px] text-[#6B6B6B]">It starts as soon as you pick. Your messages here go along with it.</span>
-                <div className="flex gap-1.5 pt-0.5">
+                <span className="text-[12.5px] leading-[17px] text-[#6B6B6B]">{state.shared ? "It starts as soon as the owner picks." : "It starts as soon as you pick. Your messages here go along with it."}</span>
+                <div className="flex gap-1.5 pt-0.5" inert={!!state.shared}>
                   <button onClick={() => void post(`/api/sessions/${s.id}/where`, { to: "mac" })} className="flex items-center gap-1.5 rounded-full bg-ink px-3 py-1.5 text-[12.5px] font-medium leading-4 text-white">
                     <MacIcon size={12} />
-                    Your Mac
+                    {ownerMac(state)}
                   </button>
                   <button onClick={() => void post(`/api/sessions/${s.id}/where`, { to: "cloud" })} className="rounded-full bg-white px-3 py-1.5 text-[12.5px] font-medium leading-4 shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]">
                     {b.name}&rsquo;s computer
@@ -1947,7 +2546,17 @@ export function ThreadSheet({
               </div>
             )}
             <span className="text-[13px] leading-4 text-[#9A9A98]">
-              {s.askWhere && live(s) ? `Waiting for you for ${since(started)}` : live(s) ? `Working for ${since(started)}` : s.status === "queued" ? "Up next" : `Worked for ${since(started, s.endedAt)}`}
+              {s.askWhere && live(s)
+                ? `Waiting for ${ownerYou(state)} for ${since(started)}`
+                : waitsForOk(s, state)
+                  ? state.shared && !writes
+                    ? "Waiting for the owner's OK"
+                    : WAITING_FOR_OK
+                  : live(s)
+                    ? `Working for ${since(started)}`
+                    : s.status === "queued"
+                      ? "Up next"
+                      : `Worked for ${since(started, s.endedAt)}`}
               {s.helperNames?.length
                 ? ` · with helpers ${s.helperNames.join(", ")}`
                 : live(s) && s.helperScreens?.length
@@ -1961,7 +2570,7 @@ export function ThreadSheet({
           {lines.map((l, i) =>
             l.kind === "note" ? (
               <p key={i} className="text-[14px] leading-[22px] [overflow-wrap:anywhere]">
-                {l.text}
+                {dropCitations(l.text)}
               </p>
             ) : l.kind === "steps" ? (
               <div key={i} className="flex flex-col gap-1 self-start">
@@ -1973,7 +2582,7 @@ export function ThreadSheet({
                     <rect x="1.5" y="2" width="11" height="7.5" rx="1.5" fill="none" stroke="#6B6B6B" strokeWidth="1.3" />
                     <path d="M5 12h4" fill="none" stroke="#6B6B6B" strokeWidth="1.3" strokeLinecap="round" />
                   </svg>
-                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{l.steps[l.steps.length - 1].detail}</span>
+                  <span className="max-w-[280px] truncate text-[12px] leading-4 text-[#3A3A38]">{plainStep(l.steps[l.steps.length - 1].detail)}</span>
                   <span className="font-mono text-[11px] leading-[14px] text-[#9A9A98]">
                     {l.steps.length} step{l.steps.length === 1 ? "" : "s"} {openSteps.includes(i) ? "‹" : "›"}
                   </span>
@@ -1995,6 +2604,19 @@ export function ThreadSheet({
               <span key={i} className="self-center text-[12px] leading-4 text-[#9A9A98]">
                 {l.text}
               </span>
+            ) : l.role === "user" && saidBy(l, state) !== "you" ? (
+              // The owner's reply, in a workspace shared with the user, or a member's (by name, in the owner's own window
+              // too): named as theirs, on the incoming side, never as the viewer's own.
+              <div key={i} className="flex max-w-[80%] flex-col items-start gap-0.5 self-start">
+                <span className="pl-3 text-[11px] leading-[14px] text-[#9A9A98]">{l.member ? l.member.name : ownerWho(state.shared)}</span>
+                <div className="whitespace-pre-wrap rounded-[18px] bg-white px-3.5 py-2 text-[14px] leading-5 text-ink shadow-[0_0_0_1px_#E2E2DF] [overflow-wrap:anywhere]">{l.text}</div>
+              </div>
+            ) : l.role === "user" && l.memberSend ? (
+              // The viewer's own reply in a shared workspace, on its way to the owner's Bops: how it stands under it.
+              <div key={i} className="flex max-w-[80%] flex-col items-end gap-0.5 self-end">
+                <div className="whitespace-pre-wrap rounded-[18px] bg-ink px-3.5 py-2 text-[14px] leading-5 text-white">{l.text}</div>
+                <MemberSendLine send={l.memberSend} retry={(key) => void memberAct({ act: "reply", sessionId: s.id, text: l.text }, key)} />
+              </div>
             ) : l.role === "user" ? (
               <div key={i} className="max-w-[80%] self-end whitespace-pre-wrap rounded-[18px] bg-ink px-3.5 py-2 text-[14px] leading-5 text-white">
                 {l.text}
@@ -2022,15 +2644,42 @@ export function ThreadSheet({
               {termError.text}
             </span>
           )}
-          {live(s) && <span className="animate-pulse text-[14px] leading-[18px] text-[#B5B5B2]">{s.status === "queued" ? "Queued" : "Thinking"}</span>}
+          {live(s) && !waitsForOk(s, state) && <span className="animate-pulse text-[14px] leading-[18px] text-[#B5B5B2]">{s.status === "queued" ? "Queued" : "Thinking"}</span>}
           <div ref={end} />
         </div>
 
-        {needsYou(s) && (
-          <div className={`px-3 pb-2 ${askedAtOpen.asked ? "" : "motion-rise-in"}`}>
-            <NeedsYouCard session={s} state={state} onShow={onShowComputer} onShowScreen={onShowScreen} onSomethingElse={() => document.getElementById("thread-reply")?.focus()} />
+        {/* Waiting for your OK: its request's card, with Deny, Always allow and Allow once (in a shared workspace, only for a viewer with Write on its bot). */}
+        {waitingAsks(state, s.id).length > 0 && (
+          <div className="flex flex-col gap-2 px-3 pb-2">
+            {waitingAsks(state, s.id).map((a) => (
+              <OwnerOnly key={a.id} only={!answersAsk(state, a)}>
+                <AppApprovalCard state={state} approval={a} />
+              </OwnerOnly>
+            ))}
           </div>
         )}
+        {needsYou(s) && (
+          <div className={`px-3 pb-2 ${askedAtOpen.asked ? "" : "motion-rise-in"}`}>
+            <OwnerOnly only={!writesThread(state, s) || (!!state.shared && askKind(s) === "elsewhere")}>
+            <NeedsYouCard
+              session={s}
+              state={state}
+              // Its own screen, for it: taking control there is for this thread (its Sign in).
+              onShow={() => (onShowScreen && (s.display ?? s.lastDisplay) !== undefined ? onShowScreen(s.botId, (s.display ?? s.lastDisplay)!, s.id) : onShowComputer())}
+              onShowScreen={onShowScreen}
+              onSomethingElse={() => document.getElementById("thread-reply")?.focus()}
+            />
+            </OwnerOnly>
+          </div>
+        )}
+        {readOnly(state, [s.botId]) ? (
+          <ReadOnlyLine state={state} botIds={[s.botId]} className="mx-3 mb-3" />
+        ) : !writesThread(state, s) ? (
+          // With Write on its bot, but it runs on the owner's Mac: a member's words never reach work there (Bops Cloud refuses them).
+          <div data-read-only className="mx-3 mb-3 rounded-[14px] bg-[#F7F7F5] px-3.5 py-2.5 text-center text-[13px] leading-[18px] text-[#6B6B6B]">
+            This runs on the owner&apos;s Mac. Only the owner can tell it more.
+          </div>
+        ) : (
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -2060,6 +2709,7 @@ export function ThreadSheet({
             </button>
           </div>
         </form>
+        )}
       </div>
     </div>
   );
@@ -2271,24 +2921,42 @@ function NeedsYouCard({
   onSomethingElse: () => void;
   onOpen?: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [working, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const b = state.bots.find((x) => x.id === s.botId);
   const name = b?.name ?? "The bot";
+  // In a shared workspace (only shown live for a viewer with Write on its bot: the caller makes it inert otherwise),
+  // answered through Bops Cloud on the owner's Bops (shared-act.ts), as the owner's own taps would be.
+  const writes = canAct(state, [s.botId]);
+  // The viewer's own answer here since the bot last asked, as it stands until the owner's Bops has it (a shared
+  // workspace: ThreadReply.memberSend): on its way the card waits, saying so; one that didn't go says why. Read from
+  // the window's state, not this card's: it may have been shut and opened again meanwhile.
+  const lastBot = [...s.replies].reverse().find((r) => r.role === "bot")?.at ?? 0;
+  const sent = state.shared ? [...s.replies].reverse().find((r) => r.role === "user" && r.memberSend && r.at > lastBot)?.memberSend : undefined;
+  const going = !!sent && sent.state !== "failed";
   const reply = async (text: string) => {
     setBusy(true);
-    await post(`/api/sessions/${s.id}/reply`, { text });
+    const r = state.shared ? await memberAct({ act: "reply", sessionId: s.id, text }) : (await post(`/api/sessions/${s.id}/reply`, { text }), { ok: true });
+    if (!r.ok && "error" in r && r.error) setError(r.error);
     setBusy(false);
   };
-  const toMac = s.runsOn !== "mac" && !!state.mac?.ready;
+  // The user's own Mac (state.mac): never where a shared workspace's thread goes.
+  const toMac = s.runsOn !== "mac" && !!state.mac?.ready && !state.shared;
   // Dismiss means done with it: the thread stops and never asks again.
   const dismiss = () => {
     setBusy(true);
-    void post(`/api/sessions/${s.id}`, { dismiss: true }, "PATCH");
+    if (state.shared)
+      void memberAct({ act: "dismiss", sessionId: s.id }).then((r) => {
+        if (!r.ok && r.error) setError(r.error);
+        setBusy(false);
+      });
+    else void post(`/api/sessions/${s.id}`, { dismiss: true }, "PATCH");
   };
   const kind = askKind(s);
   const failed = kind === "failed";
   const display = s.display ?? s.lastDisplay;
+  const busy = working || going;
+  const shownError = error ?? (sent?.state === "failed" ? (sent.error ?? "That didn't go. Try again.") : null);
   const brain = kind === "brain" ? state.brains?.find((x) => x.id === s.brainRun?.brainId) : undefined;
   const signIn = async () => {
     if (!brain) return;
@@ -2296,22 +2964,30 @@ function NeedsYouCard({
     setError(await brainSignIn(brain.id, s.botId, onShowScreen ?? (() => onShow())));
     setBusy(false);
   };
+  // A shared workspace's asks wait on its owner, never the viewer.
   const title = s.blocker
-    ? `${name} needs ${BLOCKER_ASK[s.blocker]}`
+    ? `${name} needs ${blockerAsk(state, s.blocker)}`
     : kind === "brain"
       ? `${name} needs ${brain?.name ?? "Claude Code"} signed in`
       : failed
       ? `${name} couldn't finish`
       : kind === "elsewhere"
-        ? `${name} needs you to approve it on your phone`
+        ? state.shared
+          ? `${name} needs the owner to approve it on their phone`
+          : `${name} needs you to approve it on your phone`
         : kind === "safety"
-          ? `${name} needs your OK to go on`
-          : `${name} is waiting on you`;
+          ? `${name} needs ${state.shared ? (writes ? "an" : "the owner's") : "your"} OK to go on`
+          : state.shared && writes
+            ? `${name} is waiting on an answer`
+            : `${name} is waiting on ${ownerYou(state)}`;
   const answer = withoutBriefing(s.answer ?? "").trim();
   // The question itself, so the card says what to answer (the last sentence that asks something); pinned, the bot's words when none asks.
   const asked = answer.split(/(?<=[.!?])\s+|\n+/).reverse().find((x) => x.trim().endsWith("?"))?.trim();
   const question = quote && !s.blocker && !failed ? (asked ?? (pinned ? answer : undefined)) : pinned && failed ? s.error : undefined;
   const show: Record<string, string> = { sign_in: `Sign in for ${name}`, two_factor: "Enter the code", captcha: "Solve the check", payment: "Review the payment", error: "Look at the screen" };
+  // Done at the screen yourself (signed in by taking control, say): the run that waited for it carries on, where it ran.
+  const doneAtScreen: Record<string, [string, string]> = { sign_in: ["I signed in", "I signed in. Carry on."], two_factor: ["I entered the code", "I entered the code. Carry on."], captcha: ["I solved it", "I solved the check. Carry on."] };
+  const carryOn = s.blocker && !live(s) ? doneAtScreen[s.blocker] : undefined;
   const primary = "rounded-full bg-ink px-3.5 py-1.5 text-[13px] font-semibold leading-4 text-white disabled:opacity-50";
   const plain = "rounded-full bg-white px-3.5 py-1.5 text-[13px] font-medium leading-4 shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6] disabled:opacity-50";
   const showScreen = display !== undefined && (
@@ -2332,12 +3008,18 @@ function NeedsYouCard({
         )}
       </span>
       {question && <span className={`-mt-1 pl-4 text-[13.5px] leading-[19px] text-[#3A3A38] ${pinned ? "line-clamp-3 whitespace-pre-wrap" : ""}`}>{question}</span>}
-      <div className="flex flex-wrap gap-1.5">
+      {/* A sign in, a code or a check at the screen, or a brain's sign in: the owner's own logins and screens, never a viewer's to do. */}
+      <div className="flex flex-wrap gap-1.5" inert={!!state.shared && (!!s.blocker || kind === "brain")}>
         {s.blocker ? (
           <>
             <button disabled={busy} onClick={onShow} className={primary}>
               {show[s.blocker]}
             </button>
+            {carryOn && (
+              <button disabled={busy} onClick={() => void reply(carryOn[1])} className={plain}>
+                {carryOn[0]}
+              </button>
+            )}
             {toMac && (
               <button disabled={busy} onClick={() => void post(`/api/sessions/${s.id}/where`, { move: true })} className={plain}>
                 Try on your Mac
@@ -2407,20 +3089,29 @@ function NeedsYouCard({
           </>
         )}
       </div>
-      {error && (
+      {going && <span className="pl-1 text-[12px] leading-4 text-[#9A9A98]">{sent?.state === "sending" ? "Sending…" : "Waiting for the owner's Bops to open."}</span>}
+      {shownError && (
         <span role="alert" className="pl-1 text-[12px] leading-4 text-[#B42318]">
-          {error}
+          {shownError}
         </span>
       )}
     </div>
   );
 }
 
-/** Under a thread's question kept in the chat: how the user answered it, once they have. */
-function AnsweredLine({ message: m, session: s }: { message: Message; session?: Session }) {
+/**
+ * Under a thread's question kept in the chat: how it was answered, once it has been, and by whom (saidName: "You",
+ * "Owner" or a member with Write by name, never a member's words as the owner's). Not one of the viewer's own still on
+ * its way that didn't go (ThreadReply.memberSend).
+ */
+function AnsweredLine({ message: m, session: s, state }: { message: Message; session?: Session; state: AppState }) {
   if (!s) return null;
-  const answer = s.replies.find((r) => r.role === "user" && r.at > m.at);
-  const said = answer ? `You answered: “${answer.text.length > 80 ? `${answer.text.slice(0, 79)}…` : answer.text}”` : s.dismissed ? "You dismissed it" : undefined;
+  // The answer: never what a bot passed on (`from`: a computer's runner may add one) nor a note of Bops'.
+  const answer = s.replies.find((r) => r.role === "user" && !r.from && !r.note && r.at > m.at && r.memberSend?.state !== "failed");
+  // Dismissed by a member: the reason names them ("Dismissed by Sam": member-acts.ts); else by the owner.
+  const by = /^Dismissed by (?!you$|the owner$)(.+)$/.exec(s.error ?? "")?.[1];
+  const dismisser = by ?? ownerWho(state.shared);
+  const said = answer ? `${saidName(answer, state)} answered: “${answer.text.length > 80 ? `${answer.text.slice(0, 79)}…` : answer.text}”` : s.dismissed ? `${dismisser} dismissed it` : undefined;
   if (!said) return null;
   return (
     <span className="flex items-center gap-1 pl-3 text-[11.5px] leading-4 text-[#9A9A98]">
@@ -2439,44 +3130,114 @@ const withoutBriefing = (text: string) =>
     .filter((p) => !/^\s*(computer briefing|briefing)\s*:/i.test(p) && !/^\s*computer\s*:.*\b(screens?|idle|free|untouched|home screen)\b/i.test(p))
     .join("\n\n") || text;
 
-/**
- * A bot wants to do something in one of your apps that changes it (send, create, pay), or its brain wants to
- * use a tool it may not use by itself (app "brain": cli-agents.ts approveTool): you see what, and say yes or no.
- */
 const CHANNEL_NAME: Record<string, string> = { slack: "Slack", telegram: "Telegram", discord: "Discord" };
 
+/**
+ * A request for your OK, like OpenCode's permission dock: "<Bot> wants to <action>", exactly what will happen, and
+ * Deny (with "Tell the bot what to do instead", which it's told), Always allow (Claude Code's "don't ask again": a
+ * rule for the bot and this action, whoever it's for and whatever it says, which the card says under the buttons:
+ * lib/permission.ts alwaysScope) and Allow once. Shown on every Bops of yours, wherever its run
+ * runs (a bot's computer too): the run waits for your reply and goes on from there (lib/server/permission.ts). In a
+ * shared workspace it's the owner's to answer: shown, never answered (the caller makes it inert).
+ */
 function AppApprovalCard({ state, approval: a, className = "" }: { state: AppState; approval: AppApproval; className?: string }) {
-  const [busy, setBusy] = useState(false);
+  const [working, setBusy] = useState(false);
+  // The viewer's answer from a shared workspace, as it stands (AppApproval.memberSend): the card stays while it's on
+  // its way, saying so, and says why when it didn't go, whatever this card saw (it may have been shut meanwhile).
+  const sent = a.memberSend;
+  const going = !!sent && sent.state !== "failed";
+  const busy = working || going;
+  const [telling, setTelling] = useState(false);
+  const [instead, setInstead] = useState("");
   const b = state.bots.find((x) => x.id === a.botId);
-  const s = state.sessions.find((x) => x.id === a.sessionId);
+  const s = state.sessions.find((x) => x.id === a.threadId);
+  const r = s ? undefined : state.routines.find((x) => x.id === a.routineId);
+  const name = b?.name ?? "A bot";
   // A call to an API with one of your keys (keys.tsx): which service, and the method and path in full.
   const api = apiAskOf(a);
-  const decide = async (yes: boolean) => {
+  // What went wrong answering it from a shared workspace (it shows again, with why).
+  const [error, setError] = useState<string | null>(null);
+  const decide = async (reply: "once" | "always" | "reject", message?: string) => {
     setBusy(true);
-    await post("/api/apps/approvals", { id: a.id, yes });
+    const note = message?.trim() ? { message: message.trim() } : {};
+    // In a shared workspace, a viewer with Write on its bot answers through the owner's Bops (shared-act.ts): named as theirs there.
+    if (state.shared) {
+      const r = await memberAct({ act: "answer", askId: a.id, reply, ...note });
+      setError(r.ok ? null : (r.error ?? null));
+      setBusy(false);
+      return;
+    }
+    await post("/api/apps/approvals", { id: a.id, reply, ...note });
   };
+  const shownError = going ? null : (error ?? (sent?.state === "failed" ? (sent.error ?? "That didn't go. Try again.") : null));
   const btn = "rounded-full px-3 py-1.5 text-[12.5px] font-medium leading-4 disabled:opacity-50";
   return (
     <div className={`flex flex-col gap-2.5 rounded-2xl bg-white p-3.5 shadow-[0_0_0_1px_#0000000F,0_10px_30px_-16px_#00000059] ${className}`}>
       <div className="flex items-start gap-2.5">
         {b && <Mascot botId={b.id} color={b.color} size={26} />}
         <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <span className="text-[13.5px] font-semibold leading-[18px]">
-            {api ? `${b?.name ?? "A bot"} wants to call ${api.label}` : a.app === "brain" ? `${b?.name ?? "A bot"} wants to run: ${a.title}` : `${b?.name ?? "A bot"} wants to: ${a.title}`}
-          </span>
-          {s && <span className="truncate text-[12px] leading-4 text-[#6B6B6B]">For &ldquo;{s.title}&rdquo;</span>}
+          <span className="text-[13.5px] font-semibold leading-[18px]">{`${name} wants to ${toDo(a.action)}`}</span>
+          {(s ?? r) && <span className="truncate text-[12px] leading-4 text-[#6B6B6B]">For &ldquo;{(s ?? r)!.title}&rdquo;</span>}
+          {/* Asked on a member's turn or thread: whose ask it was (only the owner answers one of their logins). */}
+          {a.askedFor && <span data-asked-for className="truncate text-[12px] leading-4 text-[#6B6B6B]">{a.askedFor} asked for it</span>}
         </div>
       </div>
-      {api && <ApiAsk ask={api} detail={a.detail} botName={b?.name ?? "The bot"} />}
-      {a.detail && !api && <pre className={`${a.app === "email" ? "max-h-[280px]" : "max-h-[180px]"} overflow-y-auto whitespace-pre-wrap rounded-xl bg-[#F7F7F6] px-3 py-2 font-sans text-[12.5px] leading-[18px] text-[#3A3A38] [overflow-wrap:anywhere]`}>{a.detail}</pre>}
-      <div className="flex gap-1.5">
-        <button disabled={busy} onClick={() => void decide(true)} className={`${btn} bg-ink text-white`}>
-          {a.app === "email" ? "Send" : "Do it"}
-        </button>
-        <button disabled={busy} onClick={() => void decide(false)} className={`${btn} bg-[#F2F2F0] hover:bg-[#EAEAE7]`}>
-          {a.app === "email" ? "Don\u2019t send" : "Don\u2019t"}
-        </button>
+      {api && <ApiAsk ask={api} detail={a.preview} botName={b?.name ?? "The bot"} />}
+      {!api && a.resources.length > 0 && a.kind !== "email" && (
+        <div className="flex flex-wrap gap-1">
+          {a.resources.map((x) => (
+            <code key={x} className="rounded-md bg-[#F7F7F6] px-1.5 py-0.5 text-[11.5px] leading-4 text-[#3A3A38] [overflow-wrap:anywhere]">
+              {x}
+            </code>
+          ))}
+        </div>
+      )}
+      {a.preview && !api && <pre className={`${a.kind === "email" ? "max-h-[280px]" : "max-h-[180px]"} overflow-y-auto whitespace-pre-wrap rounded-xl bg-[#F7F7F6] px-3 py-2 font-sans text-[12.5px] leading-[18px] text-[#3A3A38] [overflow-wrap:anywhere]`}>{a.preview}</pre>}
+      {telling && (
+        <textarea
+          autoFocus
+          value={instead}
+          onChange={(e) => setInstead(e.target.value)}
+          placeholder={`What ${name} should do instead (optional)`}
+          rows={2}
+          className="resize-none rounded-xl bg-[#F7F7F6] px-3 py-2 text-[12.5px] leading-[18px] text-ink outline-none placeholder:text-[#9A9A98] focus:shadow-[0_0_0_1.5px_#0A0A0A]"
+        />
+      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {telling ? (
+          <>
+            <button disabled={busy} onClick={() => void decide("reject", instead)} className={`${btn} bg-ink text-white`}>
+              Deny
+            </button>
+            <button disabled={busy} onClick={() => setTelling(false)} className={`${btn} bg-[#F2F2F0] hover:bg-[#EAEAE7]`}>
+              Back
+            </button>
+          </>
+        ) : (
+          <>
+            <button disabled={busy} onClick={() => void decide("reject")} className={`${btn} bg-[#F2F2F0] hover:bg-[#EAEAE7]`}>
+              Deny
+            </button>
+            <button disabled={busy} onClick={() => void decide("always")} title={alwaysScope(name, a)} className={`${btn} bg-[#F2F2F0] hover:bg-[#EAEAE7]`}>
+              Always allow
+            </button>
+            <button disabled={busy} onClick={() => void decide("once")} className={`${btn} bg-ink text-white`}>
+              Allow once
+            </button>
+            <button disabled={busy} onClick={() => setTelling(true)} className="px-1.5 py-1.5 text-[12.5px] font-medium leading-4 text-[#6B6B6B] hover:text-ink">
+              Tell the bot what to do instead
+            </button>
+          </>
+        )}
       </div>
+      {/* What Always allow covers: this bot and this action from now on, whoever it's for (lib/permission.ts). */}
+      {!telling && <span className="text-[12px] leading-4 text-[#6B6B6B]">{alwaysScope(name, a)}</span>}
+      {going && <span className="text-[12px] leading-4 text-[#9A9A98]">{sent?.state === "sending" ? "Sending…" : "Waiting for the owner's Bops to open."}</span>}
+      {shownError && (
+        <span role="alert" className="text-[12px] leading-4 text-[#B42318]">
+          {shownError}
+        </span>
+      )}
     </div>
   );
 }
@@ -2524,6 +3285,55 @@ function LeftOff({ state, session: s, onShow }: { state: AppState; session: Sess
         {s.lastPage ? (s.lastPage.title ?? s.lastPage.url) : ""}
         {taken ? `${s.lastPage ? " · " : ""}screen ${screenNo(s.lastDisplay)} is in use by ${taken} now` : ""}
       </span>
+    </div>
+  );
+}
+
+/**
+ * Preview, under a bot's name at the top of its chat, when it works on an app on the web (Your Apps, lib/hosted-apps.ts
+ * appCoders): that app's Local beside the chat (OpenPreview), its own copy's when it works on it in one. With more
+ * than one, a short list of them inline. Nothing is added to messages.
+ */
+function PreviewButton({ state, botId }: { state: AppState; botId: string }) {
+  const open = useContext(OpenPreview);
+  const [list, setList] = useState(false);
+  const [said, setSaid] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  // (Only where apps on the web are shown: lib/apps-access.ts.)
+  const apps = !appsShown(state) ? [] : (state.workspaces ?? []).flatMap((w) =>
+    Object.keys(w.hostedApps ?? {})
+      .filter((name) => appCoders(state, w.id, name).includes(botId))
+      .map((name) => ({ ws: w.id, name })),
+  );
+  if (!open || !apps.length) return null;
+  const go = async (a: { ws: string; name: string }) => {
+    setList(false);
+    setBusy(a.name);
+    setSaid(null);
+    const r = await open(a.ws, a.name, undefined, botId);
+    setBusy(null);
+    setSaid(r.error ?? r.said ?? null);
+  };
+  return (
+    <div data-chat-preview className="relative mt-1.5 flex flex-col items-center gap-1">
+      <button
+        data-chat-preview-button
+        disabled={!!busy}
+        onClick={() => (apps.length > 1 ? setList(!list) : void go(apps[0]))}
+        className="rounded-full bg-white px-2.5 py-0.5 text-[12px] font-medium leading-4 text-ink shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6] disabled:text-[#9A9A98]"
+      >
+        {busy ? "Opening…" : "Preview"}
+      </button>
+      {list && (
+        <div className="flex flex-wrap justify-center gap-1">
+          {apps.map((a) => (
+            <button key={`${a.ws}/${a.name}`} data-chat-preview-app={a.name} onClick={() => void go(a)} className="rounded-full px-2 py-0.5 text-[12px] leading-4 text-[#3A3A38] shadow-[0_0_0_1px_#ECECEA] hover:bg-[#F7F7F6]">
+              {a.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {said && <span className="max-w-[320px] text-center text-[11.5px] leading-4 text-[#6B6B6B]">{said}</span>}
     </div>
   );
 }

@@ -330,7 +330,7 @@ assert.equal(asked("POST", "/api/computers"), 0);
 // Hacker with its one computer free: made at the plan's 8 GB; its vCPUs are the template's, as far as the plan allows.
 onPlan("hacker_v2", 1, 0, { replies: { "POST /api/computers": () => json(201, { id: "c-main", name: "boppy-b", status: "creating" }) } });
 assert.deepEqual(plain(await L.makeMainComputer(main(), "boppy-b")), { id: "c-main", name: "boppy-b", status: "creating" });
-assert.deepEqual(calls.at(-1).body, { workspace_id: "ws_bops", name: "boppy-b", template_ref: "system/bops-base@0.1.8", ram: 8 });
+assert.deepEqual(calls.at(-1).body, { workspace_id: "ws_bops", name: "boppy-b", template_ref: "system/bops-base@0.1.11", ram: 8 });
 // Startup and Scale too: 8 GB, so their 4 and 16 computers fit their memory.
 for (const [tier, max] of [["startup_v2", 4], ["scale_v2", 16]]) {
   onPlan(tier, max, 0, { replies: { "POST /api/computers": () => json(201, { id: "c-x", name: "boppy-x", status: "creating" }) } });
@@ -926,7 +926,7 @@ assert.equal(P.bopsComputers([{ computerId: "c-f", freeComputer: true }, { compu
 let fo = freeOrgo("free", 0);
 const madeFree = await L.makeMainComputer(main(), "boppy-free");
 assert.deepEqual(plain(madeFree), { id: "c-free-1", free: true });
-assert.deepEqual(calls.filter((c) => c.method === "POST" && c.path === "/api/computers").at(-1).body, { workspace_id: "ws_bops", name: "boppy-free", template_ref: "system/bops-base@0.1.8", bops_free: true });
+assert.deepEqual(calls.filter((c) => c.method === "POST" && c.path === "/api/computers").at(-1).body, { workspace_id: "ws_bops", name: "boppy-free", template_ref: "system/bops-base@0.1.11", bops_free: true });
 assert.deepEqual({ id: main().computerId, free: main().freeComputer }, { id: "c-free-1", free: true });
 // Another workspace's main bot on Free: no second free one (none is asked for), it works on the free one
 // with its team, and its chat says why.
@@ -950,7 +950,7 @@ assert.equal(workBotOf(S.bot("lu")).id, "kai");
 // Then its own is on the plan, at the plan's size: never a second free one.
 const kaiOwn = await L.makeMainComputer(kai(), "kai-b");
 assert.deepEqual([kaiOwn.id, kaiOwn.free], ["c-plan-1", undefined]);
-assert.deepEqual(calls.at(-1).body, { workspace_id: "ws_bops", name: "kai-b", template_ref: "system/bops-base@0.1.8", ram: 8 });
+assert.deepEqual(calls.at(-1).body, { workspace_id: "ws_bops", name: "kai-b", template_ref: "system/bops-base@0.1.11", ram: 8 });
 S.update(() => Object.assign(kai(), { computerId: undefined, computer: undefined }));
 
 // The free one is on Orgo, but no bot here has it (this Mac's state is new): the main bot takes it up again.
@@ -1270,8 +1270,9 @@ S.update((s) => (s.account = undefined));
 /**
  * Where Bops Cloud holds plans to what they include (CloudSession.plan.limits) and Orgo counts Bops
  * computers (compute-limits' bops_computers_limit and bops_max_computer_ids), a bot's own computer is a
- * Bops computer made fresh from the Bops template (bops_free), never a copy on the Orgo plan: Max has
- * up to 5, the free one included; Free and Pro the free one only, and say so in the plan's words.
+ * Bops computer made fresh from the Bops template (bops_free), never a copy: Max has up to 5, the free
+ * one included; Free and Pro the free one only, and say so in the plan's words. On Max with them all
+ * taken, one on the Orgo plan instead (an ordinary create, fresh from the template), when it has room.
  */
 const PI = await import(`${root}/lib/plan-includes.ts`);
 // The plan Bops Cloud says counts only where the app works through it (cloud.ts cloudOn): the Mac app,
@@ -1279,15 +1280,25 @@ const PI = await import(`${root}/lib/plan-includes.ts`);
 delete process.env.BOPS_SELF_HOSTED;
 const cloudBox = globalThis.bopsCloud;
 const onBopsPlan = (tier) => (cloudBox.session = { key: "sk_test_one", value: { userId: "u1", plan: { tier, limits: true } } });
-function bopsOrgo(limit, { extras = [], refuse = false } = {}) {
-  const o = { extras: [...extras], made: 0 };
+/** `room`: the Orgo plan has room for one more computer (49 of 50); `planRefuse`: Orgo turns that create down anyway. */
+function bopsOrgo(limit, { extras = [], refuse = false, room = false, planRefuse = false } = {}) {
+  const o = { extras: [...extras], made: 0, onPlan: 0 };
   o.replies = {
     ...WORKSPACES,
-    "GET /api/user/subscription": () => json(200, { tier: "free", planLimits: null }),
+    "GET /api/user/subscription": () => json(200, { tier: room ? "scale_v2" : "free", planLimits: null }),
     "GET /api/billing/compute-limits": () =>
-      json(200, { max_computers: 0, computers_used: 0, account_ram_budget_gb: 4, account_ram_used_gb: 0, max_ram_gb: 4, bops_free_computer_id: "c-free-b", bops_max_computer_ids: o.extras, bops_computers_limit: limit }),
+      json(200, {
+        ...(room ? { max_computers: 50, computers_used: 49, account_ram_budget_gb: 1000, account_ram_used_gb: 400, max_ram_gb: 64 } : { max_computers: 0, computers_used: 0, account_ram_budget_gb: 4, account_ram_used_gb: 0, max_ram_gb: 4 }),
+        bops_free_computer_id: "c-free-b",
+        bops_max_computer_ids: o.extras,
+        bops_computers_limit: limit,
+      }),
     "POST /api/computers": (c) => {
-      if (!c.body.bops_free) return json(403, { error: "Creating a computer requires a paid plan.", code: "UPGRADE_REQUIRED" });
+      if (!c.body.bops_free) {
+        if (!room) return json(403, { error: "Creating a computer requires a paid plan.", code: "UPGRADE_REQUIRED" });
+        if (planRefuse) return json(403, { error: "Computer limit reached for your plan.", code: "PLAN_LIMIT" });
+        return json(201, { id: `c-plan-${++o.onPlan}`, name: c.body.name, status: "creating" });
+      }
       if (refuse || 1 + o.extras.length >= limit)
         return json(403, { error: limit > 1 ? "Max includes up to 3 Bops computers, and you have 3." : "Pro includes 1 Bops computer. Max includes up to 3.", code: "BOPS_COMPUTER_LIMIT" });
       const id = `c-max-${++o.made}`;
@@ -1335,6 +1346,35 @@ assert.equal(asked("POST", "/api/computers") - calls.slice(0, n).filter((c) => c
 assert.equal(nova().computer, "shared");
 assert.equal(novaNote(), "I'll work on Boppy's computer instead of one of my own. Max includes up to 3 Bops computers, and you have 3. Once your plan has room, you can switch me to Its own under Computer in my Details.");
 
+// Max with all of them taken, and room on the Orgo plan: Nova gets one of its own there, fresh from the
+// Bops template (a copy of a Bops computer can't be made), and the words say where it is.
+bopsOrgo(5, { extras: ["a", "b", "c", "d"], room: true });
+p = await L.orgoPlan({ fresh: true });
+assert.equal(P.ownOnOrgoPlan(p), true);
+assert.equal(P.ownComputerShort(p, S.getState().bots, novaWs), null, "room");
+assert.equal(await L.noOwnComputer(novaWs), null);
+assert.equal(P.ownIsBops(p, {}), false, "the one it would get is on the Orgo plan");
+ownAgain();
+n = calls.length;
+const madeOnPlan = await L.makeOwnComputer(nova(), main(), "nova-plan");
+assert.equal(madeOnPlan?.id, "c-plan-1");
+const planCreates = calls.slice(n).filter((c) => c.method === "POST" && c.path === "/api/computers");
+assert.deepEqual(planCreates.map((c) => c.body.bops_free), [undefined], "one ordinary create, on the Orgo plan, and no Bops one tried");
+assert.equal(planCreates[0].body.template_ref, O.BOPS_TEMPLATE, "fresh from the Bops template");
+assert.equal(planCreates[0].body.ram, 16, "at the plan's size for one computer");
+assert.equal(calls.slice(n).filter((c) => /\/(fork|clone)$/.test(c.path)).length, 0, "not a copy");
+assert.equal(nova().computer, "own");
+assert.deepEqual([P.ownIsBops(p, { computerId: "c-plan-1" }), P.ownIsBops(p, { computerId: "a" }), P.ownIsBops(p, { computerId: "c-free-b" })], [false, true, true]);
+assert.equal(P.bopsComputers([{ computerId: "c-free-b", freeComputer: true }, { computerId: "a" }, { computerId: "c-plan-1" }], p), 1, "only the one on the Orgo plan counts on it");
+
+// Orgo turns the create on its plan down: Nova shares, in Orgo's words.
+bopsOrgo(5, { extras: ["a", "b", "c", "d"], room: true, planRefuse: true });
+ownAgain();
+assert.equal(await L.makeOwnComputer(nova(), main(), "nova-plan-refused"), null);
+assert.equal(nova().computer, "shared");
+assert.ok(!novaNote().includes("Max includes"), novaNote());
+noDashes(novaNote());
+
 // Pro (and Free): one computer, the free one, shared by the bots. Why not, and the plan that has room.
 for (const [tier, name] of [["pro_bops", "Pro"], ["free_bops", "Free"]]) {
   onBopsPlan(tier);
@@ -1349,6 +1389,11 @@ for (const [tier, name] of [["pro_bops", "Pro"], ["free_bops", "Free"]]) {
   assert.equal(calls.slice(n).filter((c) => c.method === "POST").length, 0, `${tier}: nothing asked of Orgo`);
   assert.equal(novaNote(), `I'll work on Boppy's computer instead of one of my own. ${why} Upgrade to Max in Settings. Once your plan has room, you can switch me to Its own under Computer in my Details.`);
   noDashes(novaNote());
+  // Room on the Orgo plan doesn't change that: Pro and Free are shown Max.
+  bopsOrgo(1, { room: true });
+  p = await L.orgoPlan({ fresh: true });
+  assert.equal(P.ownOnOrgoPlan(p), false, `${tier}: not on the Orgo plan`);
+  assert.equal(P.ownComputerShort(p, S.getState().bots, novaWs)?.text, why);
 }
 
 // Orgo's word is the last: a plan read with room, turned down at the create, shares in Orgo's words.

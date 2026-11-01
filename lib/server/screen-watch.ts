@@ -1,5 +1,5 @@
 import "server-only";
-import { live, type Blocker, type FormField, type PageKind, type ScreenRead } from "@/lib/types";
+import { live, outsideThread, type Blocker, type FormField, type PageKind, type ScreenRead } from "@/lib/types";
 import { chose, decide, yes, type Question } from "./decide";
 import { pageText, type PageButton, type PageField } from "./local";
 import { mirror } from "./mirror";
@@ -199,12 +199,16 @@ export function watchScreen(botId: string, display: number, endpoint: string, se
     last = fingerprint;
     const read = await readScreen(botId, display, endpoint, session(sessionId)?.goal ?? "", sessionId);
     if (!read || stopped) return;
-    // A sign-in the vault can handle by itself never needs the user.
-    if (read.blocker && read.form) {
+    // A sign-in the vault can handle by itself (a saved login set to sign in by itself) never needs the user. Not on a
+    // stranger's work (lib/types.ts outsideThread: someone outside Bops asked for it). On a member's (memberThread) too:
+    // it signs in only with a login its bot has, and one that asks first waits for the owner's card, as for anyone.
+    if (read.blocker && read.form && !outsideThread(session(sessionId), session)) {
       const { autoSignIn } = await import("./vault");
       if (await autoSignIn(botId, display, read).catch(() => false)) return;
     }
     // The thread's chip shows it ("needs you to sign in"), and its computer draws the card; no extra chat line.
+    // On a computer's runner too, which signs nothing in by itself (its saved logins' passwords are in the
+    // Mac's Keychain): the thread waits for the user to sign in on its screen, and goes on from there.
     const s = session(sessionId);
     if (s && live(s) && !s.dismissed && s.blocker !== read.blocker) patchSession(sessionId, { blocker: read.blocker });
   };

@@ -4,28 +4,39 @@
  *
  * Every Bops computer of every Bops workspace lives in one Orgo workspace the user owns, named "bops"
  * (lib/server/orgo.ts bopsWorkspace). The people the user adds are members of that Orgo workspace:
- * they sign in on orgo.ai and see the bots' computers there, never this Mac, the chats or the vault.
+ * they sign in on orgo.ai and see every bot's computer there, and can have Orgo's agent work on any of
+ * them (Orgo's roles cover the whole workspace, whatever bots they're given in Bops), and in their own Bops they see the bots the user picks for each of them (Person.access,
+ * lib/member-access.ts), with those bots' chats and threads: watched with Read, and with Write chatted with,
+ * set to work, answered and stopped too (lib/shared.ts, cloud/members.ts). Never the user's Vault keys or this
+ * Mac's logins.
  * Bops keeps none of this itself: orgo-web holds the list, the invites and the plan's rules (Free
  * adds nobody, Pro 2 people, Max up to 5), and the app shows what it says. Nobody is added from an
  * orgo-web that doesn't send its numbers (seats): one from before that rule holds no plan to it.
  *
  * Orgo's two roles keep Orgo's names, so an invitee reads the same words on orgo.ai: View only (Orgo's
- * "member": watch the screens, change nothing) and Full access (Orgo's "admin": use the computers as
- * the user can).
+ * "member": watch the screens without clicking or typing there, and ask Orgo's agent to work on any of the
+ * computers, which runs as root there and on the user's plan: orgo-web's canUseAgent) and Full access
+ * (Orgo's "admin": use the computers as the user can). So the sheet never says View only changes nothing,
+ * nor that a bot set to None is hidden on orgo.ai, and whenever anyone else is in, it says keys Bops put
+ * on the computers can be read there (ReadyView in components/app/members.tsx).
  */
 import type { BopsTier } from "@/cloud/protocol";
+import type { AccessLevel, MemberAccess } from "./member-access";
 
 /** What someone can do on the bots' computers: "viewer" is Orgo's member (View only), "admin" Full access. */
 export type MemberRole = "viewer" | "admin";
 
-/** Someone with access besides the user. `guest`: joined with a link made on orgo.ai, so no email. */
-export type Person = { id: string; name: string; email?: string; role: MemberRole; guest: boolean };
+/**
+ * Someone with access besides the user. `guest`: joined with a link made on orgo.ai, so no email.
+ * `access`: what they may do with this workspace's bots in Bops (lib/member-access.ts; none when not set).
+ */
+export type Person = { id: string; name: string; email?: string; role: MemberRole; guest: boolean; access: MemberAccess };
 
 /**
  * An invite still waiting. `expiresAt`: Unix ms, null from an orgo-web that doesn't say. `link`: the
  * accept page, which works only for someone signed in to Orgo with the invited email.
  */
-export type Invite = { email: string; role: MemberRole; expiresAt: number | null; expired: boolean; link?: string };
+export type Invite = { email: string; role: MemberRole; expiresAt: number | null; expired: boolean; link?: string; access: MemberAccess };
 
 /**
  * Where the plan stands on people: orgo-web's numbers, which it holds the workspace to (never the
@@ -62,9 +73,14 @@ export type MembersInfo =
   | { state: "no_computers" }
   | {
       state: "ready";
+      /**
+       * The Bops workspace these are the people of: the open one when it has an Orgo workspace of its own,
+       * else the default, whose "bops" one it falls back to. Its bots are the ones they can be given.
+       */
+      wsId: string;
       /** The workspace on orgo.ai. */
       orgoUrl: string;
-      /** Where the bots work now: on this Mac, people the user adds see nothing of it. */
+      /** Where the bots work now: on this Mac, people the user adds never see its screens. */
       host: "orgo" | "mac";
       fullAccess: FullAccess;
       /**
@@ -104,10 +120,49 @@ export const FULL_ACCESS_IN_BOPS = false;
 /** The roles in Orgo's words. */
 export const ROLE_NAMES: Record<MemberRole, string> = { viewer: "View only", admin: "Full access" };
 
-/** What each role means, under the invite form and in the Give Full access dialog: Full access's is the one warning. */
+/**
+ * What each role means, under the invite form and in the Give Full access dialog: Full access's is the one
+ * warning. Both say orgo.ai and every computer, as the role is Orgo's and covers every bot's computer,
+ * whichever bots they see in Bops.
+ */
 export const ROLE_LINES: Record<MemberRole, string> = {
-  viewer: "They can watch your bots' screens live, but can't click, type or change anything on them.",
-  admin: "They can use your bots' computers as you can, including sites your bots are signed in to.",
+  viewer: "On orgo.ai they can watch every bot's computer live, and ask Orgo's agent to work on any of them, on your plan. They can't click or type there themselves.",
+  admin: "On orgo.ai they can use every bot's computer as you can, including sites your bots are signed in to.",
+};
+
+/**
+ * What each level means for a bot, under the sheet's bot picker and on hover over each level. Read is all
+ * of the bot, the owner's own chats with it too (cloud/ws-slice.ts). Write takes in Read, and they can act
+ * too: chat with it (a group only with Write on every bot in it), reply in its threads, answer what it asks
+ * and stop its runs, from their own Bops (cloud/members.ts act). Never the owner's logins, keys, Macs or
+ * settings. The levels are Bops': on orgo.ai Orgo's role covers every bot's computer, None's too.
+ */
+/** What each Your Apps level lets someone do (the People sheet's Your Apps row, lib/apps-access.ts). */
+export const APPS_TIPS: Record<AccessLevel, string> = {
+  none: "Doesn't see your apps.",
+  read: "Sees your apps on the web: sites, deploys, history and domains.",
+  write: "Also deploys them, goes back to an earlier deploy, changes a site's settings and uses your domains.",
+};
+/** The People sheet's words for Your Apps. */
+export const APPS_WORDS = {
+  row: "Your Apps",
+  legend: "Your Apps never shows them variables or keys, and only you buy domains.",
+  older: "One of your Macs runs an older Bops. A change made there can hide Your Apps from someone until this Mac is on again.",
+  needsBot: "Give them a bot first. Your Apps comes with one.",
+  notYet: "They see your apps once Bops Cloud updates. Until then, nothing changes for them.",
+};
+
+/**
+ * Whether Bops Cloud shows members a workspace's apps (cloud/ws-slice.ts appsFor) and takes their acts on them
+ * (cloud/members.ts). False until a Bops Cloud deploy carries that change: the level is kept meanwhile, and the People
+ * sheet says it starts then. The release that deploys it flips this.
+ */
+export const CLOUD_SHARES_APPS = false;
+
+export const ACCESS_TIPS: Record<AccessLevel, string> = {
+  none: "Can't see this bot in Bops. On orgo.ai they still see its computer.",
+  read: "Sees everything this bot does, including your chats with it.",
+  write: "Can chat with this bot, have it do work, answer what it asks and stop it. Never your logins, keys or Macs.",
 };
 
 /** An address the form sends: trimmed, lowercased, and shaped like name@domain.tld. Null when it isn't. */
@@ -144,10 +199,11 @@ export const WORDS = {
   fullAccessOffTip: "Off while your bots' computers hold keys from this Mac.",
   fullAccessNotYet: "Bops adds people with View only for now.",
   keysOff: "Your bots' computers hold keys from this Mac, so Full access is off.",
-  keysOffFull: "Anyone who already has it can read those keys. Switch them to View only.",
-  keysHeld: "Your bots' computers hold keys from this Mac. Anyone with Full access can read them. Switch them to View only.",
+  keysOffAnyone: "Anyone you add can still read those keys there through Orgo's agent, so add only people you'd trust with them.",
+  keysHeld: "Your bots' computers hold keys from this Mac. Anyone you add can read them there through Orgo's agent, so add only people you'd trust with them.",
   copiedPassword: "A computer password they copied keeps working until it's changed.",
   appUnreachable: "Couldn't reach Bops. Try again.",
   whatToSend: "Say who to add, and what they can do.",
+  sharedOpen: "A workspace shared with you is open. Open one of your own to choose which bots people see.",
   alreadyIn: (email: string) => `${email} already has access.`,
 };

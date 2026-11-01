@@ -1,6 +1,8 @@
 import "server-only";
 import { botChatId, isScreenWatch, live, sharesComputer, workspaceOf, type Bot } from "@/lib/types";
 import { bot, getState, update } from "./store";
+import { botsNamedInDeleted } from "./deleted";
+import { botIdsWaiting } from "./memory-deletes";
 import { ensureInbox } from "./mail";
 import { noMainComputer, noOwnComputer } from "./plan";
 import { trackServerEvent } from "./analytics";
@@ -28,12 +30,51 @@ export function contactLine(b: Bot, spoken = false) {
 
 const COLORS = ["#FF9F43", "#2EC4B6", "#A78BFA", "#F87171", "#60A5FA", "#34D399", "#E9FF3B", "#FF6FB5"];
 
-/** A bot id from a name, unique across all workspaces ("sam", then "sam-2"…). */
+/**
+ * Ids that name the user or a routine, never a bot: a tapback's `by` (lib/types.ts Reaction "owner"; "nick"
+ * from before, store.ts ownerMarks), how a chat names them, and who started a thread (Session.sentVia "you"
+ * or "routine"). A bot called "Owner" is "owner-2". A bot from before may still have one: what it does is
+ * never taken for the user's (Session.sentViaBot; no tapback from it: chat.ts botReact).
+ */
+const NOT_A_BOT = new Set(["owner", "nick", "you", "user", "routine"]);
+
+/** Whether a bot's id is one of the words that name the user or a routine (NOT_A_BOT): only a bot from before has one. */
+export const namesTheUser = (botId: string) => NOT_A_BOT.has(botId);
+
+/**
+ * A bot id from a name, unique across all workspaces ("sam", then "sam-2"…), never one that names the user
+ * or a routine (NOT_A_BOT), nor one a deleted bot left in what's kept (namedInHistory), nor one whose own memory
+ * bank is still waiting to be deleted (memory-deletes.ts botIdsWaiting): the new bot would get that bank.
+ */
 export function freeBotId(name: string) {
   const base = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "bot";
+  const named = namedInHistory();
+  for (const id of botIdsWaiting()) named.add(id);
   let botId = base;
-  for (let n = 2; bot(botId); n++) botId = `${base}-${n}`;
+  for (let n = 2; bot(botId) || NOT_A_BOT.has(botId) || named.has(botId); n++) botId = `${base}-${n}`;
   return botId;
+}
+
+/**
+ * The bot ids what's kept still names: a deleted bot's lines in a group chat that stayed (remove.ts
+ * deleteBot), the note it left handing work on, what it answered a teammate, its tapbacks, a digest line
+ * from its watch, a thread it handed over, and whatever a copy in Recently deleted on this Mac names (its
+ * lines and its thread come back with Restore: deleted.ts botsNamedInDeleted). A new bot never gets one, so
+ * none of that ever reads as the new bot's: in the chat, nor in a shared workspace, which shows someone a
+ * bot's messages by its id (cloud/ws-slice.ts), never what a bot they weren't given said.
+ */
+function namedInHistory(): Set<string> {
+  const s = getState();
+  const out = botsNamedInDeleted();
+  for (const m of s.messages) {
+    if (m.botId) out.add(m.botId);
+    if (m.from) out.add(m.from);
+    for (const a of m.asked ?? []) out.add(a.botId);
+    for (const r of m.reactions ?? []) out.add(r.by);
+    for (const h of m.held ?? []) out.add(h.botId);
+  }
+  for (const x of s.sessions) if (x.sentVia) out.add(x.sentVia);
+  return out;
 }
 
 /**
@@ -63,7 +104,8 @@ export function renameBot(botId: string, name: string): { ok: true } | { error: 
  * and `note` says why. Names are unique within a workspace; ids across all of them.
  */
 export async function createBot(name: string, role?: string, workspaceId?: string, ownComputer = false): Promise<{ botId: string; chatId: string; note?: string } | { error: string }> {
-  const clean = name.trim();
+  // As long as a rename allows (renameBot), so its id stays one people's bot access can name (lib/member-access.ts cleanAccess).
+  const clean = name.trim().slice(0, 40);
   if (!clean) return { error: "name required" };
   const ws = workspaceId ?? getState().workspace;
   const team = workspaceOf({ workspaceId: ws });
@@ -131,8 +173,14 @@ export async function setComputer(botId: string, mode: "shared" | "own"): Promis
       return { error: `couldn't delete its own computer: ${(e as Error).message}` };
     }
   }
-  // Leaving the main bot's computer: its secret there goes with it (see dropGuestKey), and its team's too for a main bot.
-  if (mode === "own") for (const x of moving) await (await import("./sessions")).dropGuestKey(x.id);
+  // Leaving the main bot's computer: its secret there goes with it (see dropGuestKey), and its team's too for a main
+  // bot, and so does each one's own folder there (its agents' wrappers, gates and OpenCode threads: bot-ai.ts leaveComputer).
+  if (mode === "own") {
+    const [{ leaveComputer }, { workComputer }] = await Promise.all([import("./bot-ai"), import("./screens")]);
+    const left = moving.map((x) => [x, workComputer(x).computerId] as const);
+    for (const x of moving) await (await import("./sessions")).dropGuestKey(x.id);
+    for (const [x, computerId] of left) if (computerId !== x.computerId) leaveComputer(x, computerId);
+  }
   update((state) => {
     // A main bot's own is the default for a main bot.
     b.computer = b.isMain ? undefined : mode;

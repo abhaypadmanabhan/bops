@@ -4,7 +4,8 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { flushSync } from "react-dom";
 import { describeSchedule, whenText } from "@/cloud/schedule";
 import { appNameFor, canonicalApp, CHECK_TEMPLATE, CHECK_TIMES, sameApp, templateById } from "@/lib/routine-catalog";
-import { botChatId, DISPLAYS, isScreenWatch, onceDone, runningNow, type AppState, type Bot, type Delivery, type Routine, type RoutineRun, type RoutineSource, type Session, type Watch } from "@/lib/types";
+import { botChatId, computerWait, DISPLAYS, isScreenWatch, onceDone, runningNow, waitingAsks, type AppState, type Bot, type Delivery, type Routine, type RoutineRun, type RoutineSource, type Session, type Watch } from "@/lib/types";
+import { you, your, yourMac } from "@/lib/shared";
 import { Fold } from "./fold";
 import { Mascot } from "./mascot";
 import {
@@ -24,9 +25,10 @@ import {
 import { watchName } from "./watch-overlay";
 import { AppLogo, BotChip, botApps, rowTrashBtn, TrashIcon } from "./apps";
 import { asCadence, asSchedule, CadencePicker, sameCadence, suggestedOf, tidy, type Cadence } from "./cadence-picker";
-import { CloseButton, currentWorkspace, needsYou, post, teamOf } from "./ui";
+import { CloseButton, currentWorkspace, needsYou, post, ReadOnlyLine, teamOf } from "./ui";
 import { FooterButton } from "./sidebar-footer";
 import { deleteQuestion, RoutineWeek, useClock, weekPlan, WeekLegend, WeekLetters } from "./routine-week";
+import { ReportsSheet } from "./routine-reports";
 
 /*
  * Routines: what the workspace's bots do on their own, and how. Schedules (routines: a reminder, a turn
@@ -80,11 +82,17 @@ const matchMonitor = (w: Watch, q: string) => has(q, watchName(w), w.site, w.loo
 
 /* ---------------- Words ---------------- */
 
-/** When a schedule runs next ("Tomorrow 9 AM"), or that it's running now (really: runningNow), paused, or done. */
-export function nextWords(r: Routine, sessions: Session[], tz?: string) {
-  if (runningNow(r, sessions)) return "Running now";
+/**
+ * When a schedule runs next ("Tomorrow 9 AM"), or that it's running now (really: runningNow), paused, or done;
+ * or, while its bot's computer is down or asleep with it overdue, that it waits and why ("Waiting: Max's
+ * computer is stopped", computerWait): it runs there once the computer is up.
+ */
+export function nextWords(r: Routine, state: Pick<AppState, "sessions" | "bots" | "runners" | "workspaces">, tz?: string) {
+  if (runningNow(r, state.sessions)) return "Running now";
   if (done(r)) return "Done";
   if (!r.enabled) return "Paused";
+  const wait = computerWait(state, r);
+  if (wait) return `Waiting: ${wait}`;
   return r.nextRunAt ? whenText(r.nextRunAt, Date.now(), tz) : describeSchedule(r.schedule, tz);
 }
 
@@ -104,19 +112,23 @@ export function trouble(r: Routine) {
 
 /**
  * A schedule needs the user: its last run or delivery failed, or the run it started is waiting on them
- * (an app action to approve, a sign-in, a question).
+ * (an app action to approve, a sign-in, a question). Never in a shared workspace: what's wrong there
+ * waits on its owner, never the viewer (no Needs you filter, count or row note).
  */
 export function scheduleNeedsYou(r: Routine, state: AppState) {
+  if (state.shared) return false;
   if (trouble(r)) return true;
+  // A chat run of it paused for the user's OK (its request names the routine and no thread).
+  if (waitingAsks(state).some((a) => a.routineId === r.id && !a.threadId)) return true;
   const sid = r.last?.sessionId;
   if (!sid) return false;
-  if (state.appApprovals?.some((a) => a.sessionId === sid)) return true;
+  if (waitingAsks(state, sid).length) return true;
   const s = state.sessions.find((x) => x.id === sid);
   return !!s && needsYou(s);
 }
 
-/** A monitor needs the user when its page couldn't be read (news is its own mark, New). */
-export const monitorNeedsYou = (w: Watch) => !!w.page?.error && !w.paused;
+/** A monitor needs the user when its page couldn't be read (news is its own mark, New). Never in a shared workspace (scheduleNeedsYou). */
+export const monitorNeedsYou = (w: Watch, state?: Pick<AppState, "shared">) => !state?.shared && !!w.page?.error && !w.paused;
 
 /** A Connected App's or a key's name as the user knows it: from their accounts or the catalog ("Stripe"), else its slug, capitalized. */
 export function appNameOf(state: AppState, app: string) {
@@ -189,6 +201,8 @@ export const RAN: Record<RoutineRun["status"], string> = {
   failed: "Failed",
   skipped: "Skipped",
 };
+/** How a run went, as a viewer reads it: a quiet run had nothing for the owner in a workspace shared with them (lib/shared.ts you). */
+const ranWords = (status: RoutineRun["status"], state: AppState) => (status === "quiet" ? `Ran, nothing for ${you(state)}` : RAN[status]);
 
 /** How often a page is read: "Every 30 minutes", "Every hour", "Every 2 hours". */
 function everyWords(min: number) {
@@ -203,7 +217,7 @@ const shortUrl = (url: string) => url.replace(/^https?:\/\//i, "").replace(/^www
 /** What a watch looks at, in words: a page, a window on the user's Mac, or one of a bot's screens. */
 function whereWords(w: Watch, state: AppState) {
   if (w.page) return shortUrl(w.page.url);
-  if (w.mac) return `${w.mac.app} on your Mac`;
+  if (w.mac) return `${w.mac.app} on ${yourMac(state)}`;
   return `${state.bots.find((b) => b.id === w.botId)?.name ?? "Bot"}'s screen ${DISPLAYS.indexOf(w.display) + 1}`;
 }
 
@@ -301,7 +315,7 @@ export function AutopilotButton({ state, expanded = false, pressed = expanded, o
       expanded={expanded}
       pressed={pressed}
       label={GROUP_NAME}
-      tip={news ? `${GROUP_NAME}: ${news === 1 ? "a monitor has" : `${news} monitors have`} news` : `${GROUP_NAME}: what your bots do on their own`}
+      tip={news ? `${GROUP_NAME}: ${news === 1 ? "a monitor has" : `${news} monitors have`} news` : `${GROUP_NAME}: what ${your(state)} bots do on their own`}
       ariaLabel={news ? `${GROUP_NAME}, ${news} with news` : GROUP_NAME}
       onClick={() => onOpen({ section, focus: fresh?.id })}
       icon={<AutopilotIcon size={16} />}
@@ -349,9 +363,9 @@ function SidebarGroup({
   // One row, and what comes next under it: monitors with news, then the soonest
   // schedules, then the other monitors. Nothing under it while there are none (the page says how).
   const next = [
-    ...monitors.filter((w) => w.alert).map((w) => <MonitorLine key={w.id} watch={w} onClick={() => onOpenWatch(w)} />),
-    ...schedules.map((r) => <ScheduleLine key={r.id} routine={r} sessions={state.sessions} tz={tz} onClick={() => onOpen({ section: "schedules", focus: r.id })} />),
-    ...monitors.filter((w) => !w.alert).map((w) => <MonitorLine key={w.id} watch={w} onClick={() => onOpenWatch(w)} />),
+    ...monitors.filter((w) => w.alert).map((w) => <MonitorLine key={w.id} watch={w} onClick={() => onOpenWatch(w)} readOnly={!!state.shared} />),
+    ...schedules.map((r) => <ScheduleLine key={r.id} routine={r} state={state} tz={tz} onClick={() => onOpen({ section: "schedules", focus: r.id })} />),
+    ...monitors.filter((w) => !w.alert).map((w) => <MonitorLine key={w.id} watch={w} onClick={() => onOpenWatch(w)} readOnly={!!state.shared} />),
   ];
   const max = q ? FIRST : 3;
   const first = SECTIONS.find((s) => lists[s.id].length)?.id ?? "schedules";
@@ -383,10 +397,10 @@ const SIDE_ROW =
   "flex h-[30px] shrink-0 items-center gap-2 rounded-[10px] pl-8 pr-2.5 text-left outline-none hover:bg-black/[0.03] focus-visible:shadow-[inset_0_0_0_1.5px_#0A0A0A]";
 
 /** A schedule in the sidebar: its name, then when it runs next (or Paused, Done) and "quiet" in grey; a red dot when its last run or delivery failed. */
-function ScheduleLine({ routine: r, sessions, tz, onClick }: { routine: Routine; sessions: Session[]; tz?: string; onClick: () => void }) {
+function ScheduleLine({ routine: r, state, tz, onClick }: { routine: Routine; state: AppState; tz?: string; onClick: () => void }) {
   const fresh = useFresh(r.id);
   const bad = trouble(r);
-  const line = [nextWords(r, sessions, tz), r.quiet ? "quiet" : ""].filter(Boolean).join(" · ");
+  const line = [nextWords(r, state, tz), r.quiet ? "quiet" : ""].filter(Boolean).join(" · ");
   return (
     <button onClick={onClick} onAnimationEnd={fresh.done} className={`${SIDE_ROW} ${fresh.on ? "motion-new-item" : ""}`}>
       <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[18px]">
@@ -406,7 +420,7 @@ function ScheduleLine({ routine: r, sessions, tz, onClick }: { routine: Routine;
  * has news, Paused while the user paused it or the screen shows something else, a red dot when a page
  * couldn't be read; × stops it.
  */
-function MonitorLine({ watch: w, onClick }: { watch: Watch; onClick: () => void }) {
+function MonitorLine({ watch: w, onClick, readOnly }: { watch: Watch; onClick: () => void; readOnly?: boolean }) {
   const fresh = useFresh(w.id);
   // Its New mark pops when news comes in while it's shown.
   const pop = usePop(!!w.alert);
@@ -433,11 +447,13 @@ function MonitorLine({ watch: w, onClick }: { watch: Watch; onClick: () => void 
       ) : (
         off && <span className="shrink-0 text-[12px] text-[#9A9A98] group-hover/watch:hidden group-has-[:focus-visible]/watch:hidden group-focus-visible/watch:hidden">Paused</span>
       )}
-      <DeleteX
-        label={`Stop watching ${watchName(w)}`}
-        onDelete={() => void post(`/api/watches?id=${encodeURIComponent(w.id)}`, {}, "DELETE")}
-        className="group-hover/watch:opacity-100 group-focus-visible/watch:opacity-100"
-      />
+      {!readOnly && (
+        <DeleteX
+          label={`Stop watching ${watchName(w)}`}
+          onDelete={() => void post(`/api/watches?id=${encodeURIComponent(w.id)}`, {}, "DELETE")}
+          className="group-hover/watch:opacity-100 group-focus-visible/watch:opacity-100"
+        />
+      )}
     </button>
   );
 }
@@ -451,7 +467,7 @@ export type RoutineFilter = { bot?: string; app?: string; needsYou?: boolean };
 export function filterRoutines(state: AppState, lists: { schedules: Routine[]; monitors: Watch[] }, f: RoutineFilter) {
   return {
     schedules: lists.schedules.filter((r) => (!f.bot || r.botId === f.bot) && (!f.app || (!!r.source && sameApp(r.source.app, f.app))) && (!f.needsYou || scheduleNeedsYou(r, state))),
-    monitors: lists.monitors.filter((w) => (!f.bot || w.botId === f.bot) && (!f.app || (!!w.source && sameApp(w.source.app, f.app))) && (!f.needsYou || monitorNeedsYou(w))),
+    monitors: lists.monitors.filter((w) => (!f.bot || w.botId === f.bot) && (!f.app || (!!w.source && sameApp(w.source.app, f.app))) && (!f.needsYou || monitorNeedsYou(w, state))),
   };
 }
 
@@ -516,6 +532,7 @@ export function RoutineList({
   openId,
   onToggle,
   onOpenWatch,
+  onReport,
   chips = false,
   className = "shadow-[0_0_0_1px_#ECECEA]",
 }: {
@@ -525,6 +542,8 @@ export function RoutineList({
   openId: string | null;
   onToggle: (id: string) => void;
   onOpenWatch: (w: Watch) => void;
+  /** A schedule's reports (the Routines page's sheet), at one of its runs (its start) when given; `from`: where focus goes back. */
+  onReport?: (id: string, at?: number, from?: HTMLElement) => void;
   chips?: boolean;
   className?: string;
 }) {
@@ -534,7 +553,17 @@ export function RoutineList({
   return (
     <div className={`flex flex-col overflow-hidden rounded-2xl ${className}`}>
       {schedules.map((r, i) => (
-        <ScheduleRow key={r.id} routine={r} state={state} tz={tz} chip={chips} last={i === n - 1} open={openId === r.id} onToggle={() => onToggle(r.id)} />
+        <ScheduleRow
+          key={r.id}
+          routine={r}
+          state={state}
+          tz={tz}
+          chip={chips}
+          last={i === n - 1}
+          open={openId === r.id}
+          onToggle={() => onToggle(r.id)}
+          onReport={onReport && ((at, from) => onReport(r.id, at, from))}
+        />
       ))}
       {monitors.map((w, i) => (
         <MonitorRow
@@ -604,7 +633,8 @@ export function RoutinesEmpty({ bot, asks, onAsk, children }: { bot?: Bot; asks?
  * page is asked for at it, from a bot's profile), a Connected App they came from, and Needs you (a failed
  * run or delivery, a run waiting on the user, a page that can't be read). Nothing yet, for the workspace
  * or the bot picked: what to ask for, and a way to ask (RoutinesEmpty). How a bot does each job is a
- * skill: a link goes there.
+ * skill: a link goes there. A run in the week (its line), or a row's Reports (its Last run's See report),
+ * opens that routine's reports over the page (routine-reports.tsx): every run and what each said.
  */
 export function AutopilotPage({
   state,
@@ -615,6 +645,7 @@ export function AutopilotPage({
   onOpenWatch,
   onOpenSkills,
   onAsk,
+  onOpenThread,
   onClose,
 }: {
   state: AppState;
@@ -633,6 +664,8 @@ export function AutopilotPage({
   onOpenSkills: () => void;
   /** Ask a bot: its chat, with `text` in the message box to change and send (bops-app.tsx askBot). */
   onAsk: (botId: string, text?: string) => void;
+  /** Open a routine run's thread (bops-app.tsx openThread), from its report. */
+  onOpenThread?: (s: Session) => void;
   onClose: () => void;
 }) {
   // "Tomorrow 9 AM", "5m ago" stay current.
@@ -682,92 +715,117 @@ export function AutopilotPage({
   const chips = team.length > 1 && !pickedBot;
   const week = shown.schedules.length > 0;
   const appFilters = total > 0 && (apps.length > 0 || needsN > 0 || !!filter.needsYou);
+  // A routine's reports, over the page (routine-reports.tsx), at a run when one was picked; focus goes back where it was opened from.
+  const [report, setReport] = useState<{ id: string; at?: number; key: number } | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const reported = report ? state.routines.find((r) => r.id === report.id) : undefined;
+  const openReport = (id: string, at?: number, from?: HTMLElement) => {
+    const had = document.activeElement as HTMLElement | null;
+    opener.current = from ?? (had && had !== document.body && typeof had.focus === "function" ? had : null);
+    setReport({ id, at, key: Date.now() });
+  };
+  const closeReport = useCallback(() => {
+    // Back where it was opened from, unless focus has moved out of the sheet since (into the chat beside the page).
+    const had = document.activeElement;
+    const back = !had || had === document.body || !!had.closest('[role="dialog"]');
+    flushSync(() => setReport(null));
+    if (back && opener.current?.isConnected) opener.current.focus();
+    opener.current = null;
+  }, []);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-6 pb-8 pt-7">
-      <div className="flex w-full max-w-[560px] flex-col gap-5">
-        <div className="flex items-start gap-3.5">
-          <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-ink text-highlighter">
-            <AutopilotIcon size={20} />
-          </span>
-          <div className="flex min-w-0 flex-1 flex-col gap-1">
-            {/* Where focus goes when the last routine is deleted (focusAfterRemove). */}
-            <span data-list-heading tabIndex={-1} className="text-[20px] font-semibold leading-6 tracking-[-0.01em] outline-none">
-              {GROUP_NAME}
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      {/* Behind the reports while they're open: nothing here takes focus or a click. */}
+      <div className="flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-6 pb-8 pt-7" inert={!!reported}>
+        <div className="flex w-full max-w-[560px] flex-col gap-5">
+          {/* A shared workspace's routines are the owner's: shown, never changed here (view-only.ts holds every change). */}
+          <ReadOnlyLine state={state} />
+          <div className="flex items-start gap-3.5">
+            <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-ink text-highlighter">
+              <AutopilotIcon size={20} />
             </span>
-            <span className="text-[13px] leading-[19px] text-[#6B6B6B]">
-              What your bots do on their own. How they do each job is in{" "}
-              {/* The link and its period together, so the period never starts a line on its own. */}
-              <span className="whitespace-nowrap">
-                <button onClick={onOpenSkills} className="font-medium text-ink underline decoration-[#C9C9C6] underline-offset-2 hover:decoration-ink">
-                  Skills
-                </button>
-                .
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              {/* Where focus goes when the last routine is deleted (focusAfterRemove). */}
+              <span data-list-heading tabIndex={-1} className="text-[20px] font-semibold leading-6 tracking-[-0.01em] outline-none">
+                {GROUP_NAME}
               </span>
-            </span>
+              <span className="text-[13px] leading-[19px] text-[#6B6B6B]">
+                {state.shared ? "What the owner's bots do on their own" : "What your bots do on their own"}. How they do each job is in{" "}
+                {/* The link and its period together, so the period never starts a line on its own. */}
+                <span className="whitespace-nowrap">
+                  <button onClick={onOpenSkills} className="font-medium text-ink underline decoration-[#C9C9C6] underline-offset-2 hover:decoration-ink">
+                    Skills
+                  </button>
+                  .
+                </span>
+              </span>
+            </div>
+            <CloseButton onClick={onClose} className="mt-1.5" />
           </div>
-          <CloseButton onClick={onClose} className="mt-1.5" />
-        </div>
 
-        {(team.length > 1 || appFilters) && (
-          <div className="flex flex-col gap-2">
-            {/* Every bot, with how many each runs: whose each color in the week is, and which bot's to show. */}
-            {team.length > 1 && <WeekLegend bots={team} on={botOn} counts={counts} all={total} onPick={(bot) => setFilter({ ...filter, bot })} />}
-            {appFilters && (
-              <div className="flex flex-wrap gap-1.5" role="group" aria-label="Connected App and Needs you">
-                {(needsN > 0 || filter.needsYou) && (
-                  <FilterPill on={!!filter.needsYou} onClick={() => setFilter({ ...filter, needsYou: !filter.needsYou })}>
-                    Needs you
-                    <span className={`tabular-nums ${filter.needsYou ? "text-white/60" : "text-[#9A9A98]"}`}>{needsN}</span>
-                  </FilterPill>
-                )}
-                {apps.map((a) => (
-                  <FilterPill key={a} on={filter.app === a} onClick={() => setFilter({ ...filter, app: filter.app === a ? undefined : a })}>
-                    <AppLogo app={a} name={appNameOf(state, a)} size={14} />
-                    {appNameOf(state, a)}
-                  </FilterPill>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* One remove question at a time, in the week or the list; opening a row, or another filter, closes it. */}
-        <QuestionScope reset={`${openId ?? ""}|${botOn ?? ""}|${filter.app ?? ""}|${filter.needsYou ? 1 : 0}`}>
-          {week && (
-            <RoutineWeek
-              routines={shown.schedules}
-              // One bot's: its lines needn't say its name.
-              bots={pickedBot ? [pickedBot] : team}
-              tz={tz}
-              now={now}
-              zoneOf={zone}
-              running={(r) => runningNow(r, state.sessions)}
-              needsYou={(r) => scheduleNeedsYou(r, state)}
-              checked={(x) => checkedOf(state, x)}
-              onOpen={(id) => setPicked({ id, at: Date.now() })}
-            />
+          {(team.length > 1 || appFilters) && (
+            <div className="flex flex-col gap-2">
+              {/* Every bot, with how many each runs: whose each color in the week is, and which bot's to show. */}
+              {team.length > 1 && <WeekLegend bots={team} on={botOn} counts={counts} all={total} onPick={(bot) => setFilter({ ...filter, bot })} />}
+              {appFilters && (
+                <div className="flex flex-wrap gap-1.5" role="group" aria-label={state.shared ? "Connected App" : "Connected App and Needs you"}>
+                  {(needsN > 0 || filter.needsYou) && (
+                    <FilterPill on={!!filter.needsYou} onClick={() => setFilter({ ...filter, needsYou: !filter.needsYou })}>
+                      Needs you
+                      <span className={`tabular-nums ${filter.needsYou ? "text-white/60" : "text-[#9A9A98]"}`}>{needsN}</span>
+                    </FilterPill>
+                  )}
+                  {apps.map((a) => (
+                    <FilterPill key={a} on={filter.app === a} onClick={() => setFilter({ ...filter, app: filter.app === a ? undefined : a })}>
+                      <AppLogo app={a} name={appNameOf(state, a)} size={14} />
+                      {appNameOf(state, a)}
+                    </FilterPill>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
 
-          <div ref={list} data-rows className="flex flex-col gap-5">
-            {pickedBot && !counts[pickedBot.id] ? (
-              <RoutinesEmpty bot={pickedBot} asks={askable(state, pickedBot)} onAsk={onAsk} />
-            ) : !total ? (
-              <RoutinesEmpty asks={askable(state, main)} onAsk={onAsk} />
-            ) : !shown.schedules.length && !shown.monitors.length ? (
-              <div className="flex flex-col items-center gap-2 py-10 text-center text-[13.5px] leading-5 text-[#6B6B6B]">
-                Nothing matches these filters
-                <button onClick={() => setFilter({})} className={small("plain")}>
-                  Show all
-                </button>
-              </div>
-            ) : (
-              // One list, in its order, each row with the bot that runs it (the row of bots above picks one).
-              <RoutineList state={state} schedules={shown.schedules} monitors={shown.monitors} openId={openId} onToggle={toggle} onOpenWatch={onOpenWatch} chips={chips} />
+          {/* One remove question at a time, in the week or the list; opening a row, or another filter, closes it. */}
+          <QuestionScope reset={`${openId ?? ""}|${botOn ?? ""}|${filter.app ?? ""}|${filter.needsYou ? 1 : 0}`}>
+            {week && (
+              <RoutineWeek
+                routines={shown.schedules}
+                // One bot's: its lines needn't say its name.
+                bots={pickedBot ? [pickedBot] : team}
+                tz={tz}
+                now={now}
+                zoneOf={zone}
+                running={(r) => runningNow(r, state.sessions)}
+                needsYou={(r) => scheduleNeedsYou(r, state)}
+                checked={(x) => checkedOf(state, x)}
+                onOpen={(id) => setPicked({ id, at: Date.now() })}
+                onReport={openReport}
+                viewOnly={!!state.shared}
+              />
             )}
-          </div>
-        </QuestionScope>
+
+            <div ref={list} data-rows className="flex flex-col gap-5">
+              {pickedBot && !counts[pickedBot.id] ? (
+                <RoutinesEmpty bot={pickedBot} asks={askable(state, pickedBot)} onAsk={onAsk} />
+              ) : !total ? (
+                <RoutinesEmpty asks={askable(state, main)} onAsk={onAsk} />
+              ) : !shown.schedules.length && !shown.monitors.length ? (
+                <div className="flex flex-col items-center gap-2 py-10 text-center text-[13.5px] leading-5 text-[#6B6B6B]">
+                  Nothing matches these filters
+                  <button onClick={() => setFilter({})} className={small("plain")}>
+                    Show all
+                  </button>
+                </div>
+              ) : (
+                // One list, in its order, each row with the bot that runs it (the row of bots above picks one).
+                <RoutineList state={state} schedules={shown.schedules} monitors={shown.monitors} openId={openId} onToggle={toggle} onOpenWatch={onOpenWatch} onReport={openReport} chips={chips} />
+              )}
+            </div>
+          </QuestionScope>
+        </div>
       </div>
+      {reported && report && <ReportsSheet key={report.key} state={state} routine={reported} at={report.at} onClose={closeReport} onOpenThread={onOpenThread} />}
     </div>
   );
 }
@@ -1173,6 +1231,7 @@ export function ScheduleRow({
   last,
   open,
   onToggle,
+  onReport,
 }: {
   routine: Routine;
   state: AppState;
@@ -1181,6 +1240,8 @@ export function ScheduleRow({
   last: boolean;
   open: boolean;
   onToggle: () => void;
+  /** Its reports (every run, what each said), at one run (its start) when given; `from`: the button, where focus goes back. */
+  onReport?: (at?: number, from?: HTMLElement) => void;
 }) {
   const { busy, error, setError, sure, ask, run, cancelRemove, remove, row, removeButton } = useActions("schedule", r.id, open);
   const [editing, setEditing] = useState(false);
@@ -1207,7 +1268,7 @@ export function ScheduleRow({
       id={r.id}
       lead={chip ? undefined : <BotMark bot={bot} />}
       title={undash(r.title)}
-      line={`${describeSchedule(r.schedule, zone)} · ${nextWords(r, state.sessions, tz)}${r.quiet ? " · quiet" : ""}`}
+      line={`${describeSchedule(r.schedule, zone)} · ${nextWords(r, state, tz)}${r.quiet ? " · quiet" : ""}`}
       dim={!r.enabled}
       end={
         <>
@@ -1237,7 +1298,7 @@ export function ScheduleRow({
       open={open}
       onToggle={onToggle}
       rowRef={row}
-      remove={{ label: `Delete ${undash(r.title)}`, tip: "Delete", busy: !!busy, onAsk: ask }}
+      remove={state.shared ? undefined : { label: `Delete ${undash(r.title)}`, tip: "Delete", busy: !!busy, onAsk: ask }}
       confirm={
         sure && (
           <>
@@ -1254,11 +1315,18 @@ export function ScheduleRow({
         )
       }
     >
-      {/* What can be done to it first, above what it does (often long). The question takes their place. */}
-      {!sure && (
+      {/* What can be done to it first, above what it does (often long). The question takes their place. A shared workspace's are the owner's to do; its reports are there to read. */}
+      {!sure && state.shared && onReport && (
+        <div className="-ml-2.5 flex flex-wrap items-center gap-0.5">
+          <button onClick={(e) => onReport(undefined, e.currentTarget)} className={small("plain")}>
+            Reports
+          </button>
+        </div>
+      )}
+      {!sure && !state.shared && (
         <div className="-ml-2.5 flex flex-wrap items-center gap-0.5">
           <button onClick={() => void run("run", "/api/routines", { id: r.id, action: "run" }, "PATCH")} disabled={!!busy || runningNow(r, state.sessions)} className={small("plain")}>
-            {busy === "run" ? "Running…" : "Run now"}
+            {busy === "run" ? "Running…" : r.last?.status === "failed" ? "Run again" : "Run now"}
           </button>
           {canSkip && (
             <button
@@ -1278,6 +1346,11 @@ export function ScheduleRow({
           {!r.reminder && (
             <button onClick={() => setEditing(true)} disabled={!!busy} className={small("plain")}>
               Edit
+            </button>
+          )}
+          {onReport && (
+            <button onClick={(e) => onReport(undefined, e.currentTarget)} className={small("plain")}>
+              Reports
             </button>
           )}
           <button ref={removeButton} onClick={() => ask("inside")} disabled={!!busy} className={small("red")}>
@@ -1311,7 +1384,7 @@ export function ScheduleRow({
               <span key="when">
                 {`${describeSchedule(r.schedule, zone)}${next ? `. Next: ${next}` : ""}`}
                 {zone && zone !== tz ? <span className="text-[#9A9A98]">{` (${zone.split("/").pop()?.replace(/_/g, " ")} time)`}</span> : null}
-                {!done(r) && (
+                {!done(r) && !state.shared && (
                   <button onClick={() => setChangingWhen(true)} disabled={!!busy} className="ml-1.5 text-[12px] font-medium leading-4 text-ink underline-offset-2 outline-none hover:underline focus-visible:underline disabled:opacity-40">
                     Change
                   </button>
@@ -1326,6 +1399,7 @@ export function ScheduleRow({
                 {skips.map((x) => (
                   <span key={x} className="inline-flex items-center gap-1 rounded-full bg-[#F2F2F0] py-0.5 pl-2 pr-0.5 text-[12px] leading-4">
                     <span className="line-through decoration-[#9A9A98]">{whenText(x, now, tz)}</span>
+                    {!state.shared && (
                     <button
                       onClick={() => void run("unskip", "/api/routines", { id: r.id, action: "unskip", at: x }, "PATCH")}
                       disabled={!!busy}
@@ -1334,13 +1408,14 @@ export function ScheduleRow({
                     >
                       Undo
                     </button>
+                    )}
                   </span>
                 ))}
               </span>
             ),
           ],
           ["Runs", howWords(r)],
-          ["Quiet", r.quiet ? "Yes: it posts only when there's something for you" : ""],
+          ["Quiet", r.quiet ? `Yes: it posts only when there's something for ${you(state)}` : ""],
           ["Results go to", destinations(r, state)],
           // Set up on someone else's say (an email or a text from outside): who, so the user can tell.
           ["Set up by", r.fromOutside ? undash(r.fromOutside) : ""],
@@ -1349,7 +1424,12 @@ export function ScheduleRow({
             ran && (
               <span className="flex flex-col gap-0.5">
                 <span>
-                  {RAN[ran.status]} · {since(ran.at)}
+                  {ranWords(ran.status, state)} · {since(ran.at)}
+                  {onReport && (
+                    <button onClick={(e) => onReport(ran.at, e.currentTarget)} className="ml-1.5 text-[12px] font-medium leading-4 text-ink underline-offset-2 outline-none hover:underline focus-visible:underline">
+                      See report
+                    </button>
+                  )}
                 </span>
                 {ran.error && <span className="text-[#B42318]">{undash(ran.error)}</span>}
               </span>
@@ -1430,7 +1510,7 @@ export function MonitorRow({
       open={open}
       onToggle={onToggle}
       rowRef={row}
-      remove={{ label: `Stop watching ${watchName(w)}`, tip: "Stop", busy: !!busy, onAsk: ask }}
+      remove={state.shared ? undefined : { label: `Stop watching ${watchName(w)}`, tip: "Stop", busy: !!busy, onAsk: ask }}
       confirm={
         sure && (
           <>
@@ -1447,7 +1527,7 @@ export function MonitorRow({
         )
       }
     >
-      {!sure && (
+      {!sure && !state.shared && (
         <div className="-ml-2.5 flex flex-wrap items-center gap-0.5">
           {(isScreenWatch(w) || !!w.mac) && (
             <button onClick={onShow} disabled={!!busy} className={small("plain")}>
@@ -1491,7 +1571,7 @@ export function MonitorRow({
           ["Checked", checked ? since(checked) : page ? "Not yet" : ""],
           ["Changed", page?.changedAt ? since(page.changedAt) : ""],
           ["Read", page?.via === "browser" ? "In a browser, since the page needs one" : ""],
-          ["Paused", w.paused ? "Yes, until you resume it" : w.away ? "It isn't showing right now" : ""],
+          ["Paused", w.paused ? (state.shared ? "Yes, until the owner resumes it" : "Yes, until you resume it") : w.away ? "It isn't showing right now" : ""],
           [
             "News",
             w.alert && (

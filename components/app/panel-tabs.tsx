@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, createElement, useEffect, useRef, useState } from "react";
+import { appsLine, appsName } from "@/lib/apps-access";
 import { GROUP_NAME } from "@/lib/memory-categories";
 import { live, type AppState } from "@/lib/types";
 import { computerOf } from "@/lib/screens";
@@ -9,9 +10,11 @@ import type { Section } from "./bot-panel";
 import { CrmFileIcon } from "./crm";
 import { Mascot } from "./mascot";
 import { MacIcon } from "./mac-tab";
+import { AppMark, AppsIcon } from "./made-apps";
 import { KnowledgeIcon, type OrbitSection } from "./memory-categories";
 import { KeyIcon } from "./screen-cards";
 import { MonitorIcon, teamOf } from "./ui";
+import { readOnly } from "@/lib/shared";
 
 /*
  * The right side is a row of tabs in the title bar, like a browser's. The first tab is always the
@@ -40,14 +43,36 @@ export type PanelTab =
    * workspace, at the row asked for (`focus`) and the bot asked for (`bot`: only its, from its profile);
    * `focusAt` is when they were asked for, so asking again shows them again.
    */
-  | { id: string; kind: "autopilot"; ws: string; section: AutopilotSection; focus?: string; focusAt?: number; bot?: string };
+  | { id: string; kind: "autopilot"; ws: string; section: AutopilotSection; focus?: string; focusAt?: number; bot?: string }
+  /** An app a bot made (made-apps.tsx): built live here, then used. */
+  | { id: string; kind: "made-app"; appId: string }
+  /** Every app the bots made in a workspace, as tiles (made-apps.tsx). */
+  | { id: string; kind: "made-apps"; ws: string }
+  /** An app a workspace runs on the web, by its Ingot repo's name (hosted-apps.tsx): its address, history and deploys. */
+  | { id: string; kind: "hosted-app"; ws: string; name: string }
+  /**
+   * An app's Local, live beside its bot's chat (preview-tab.tsx): its dev server on its computer, seen at
+   * http://localhost:<its port> on this Mac (`url`), in a session of its own (previewPartition). `bot`: the bot whose
+   * copy of the app it's of (lib/hosted-apps.ts copyBotOf; none: the app's own folder's). Never saved.
+   */
+  | { id: string; kind: "preview"; ws: string; name: string; site?: string; bot?: string; url: string };
 
 /** The tab that follows the chat. */
 export const CHAT_TAB = "chat";
 
-/** A tab you're reading (a page, the Vault, a CRM file, Knowledge and Skills in it, a profile, Routines): a new "Needs you" doesn't take the panel from it. */
+/** A tab you're reading (a page, Logins, a CRM file, Knowledge and Skills in it, a profile, Routines, an app a bot made, an app on the web or the Apps home): a new "Needs you" doesn't take the panel from it. */
 export const isReading = (t?: PanelTab) =>
-  !!t && (t.kind === "web" || t.kind === "vault" || t.kind === "crm" || t.kind === "memory" || t.kind === "bot" || t.kind === "autopilot");
+  !!t &&
+  (t.kind === "web" ||
+    t.kind === "vault" ||
+    t.kind === "crm" ||
+    t.kind === "memory" ||
+    t.kind === "bot" ||
+    t.kind === "autopilot" ||
+    t.kind === "made-app" ||
+    t.kind === "hosted-app" ||
+    t.kind === "preview" ||
+    t.kind === "made-apps");
 
 /**
  * The Knowledge tab, opened again for a kind, an item or a search: on the kind asked for, else where it
@@ -61,7 +86,31 @@ export function memoryAgain(t: Extract<PanelTab, { kind: "memory" }>, { category
 /** Open a link as a tab on the right; null outside the app (links then open in the browser). */
 export const OpenLink = createContext<((url: string, title?: string) => void) | null>(null);
 
-const electron = () => typeof navigator !== "undefined" && navigator.userAgent.includes("Electron");
+/** What Open preview said when it couldn't show Local beside the chat: why, and whether it opened on the bot's screen instead. */
+export type PreviewOpened = { error?: string; screen?: true; said?: string };
+
+/**
+ * Open an app's Local beside its bot's chat (bops-app.tsx openPreview): its chat, its Local started when it isn't,
+ * and its Preview tab, or its bot's screen when this Mac can't reach it; `bot`: of that bot's copy of the app, in its
+ * chat (none: the app's own folder's, beside its own bot's). Null where there's no panel.
+ */
+export const OpenPreview = createContext<((ws: string, name: string, site?: string, bot?: string) => Promise<PreviewOpened>) | null>(null);
+
+/** A localhost link a bot gave in its chat, opened as its app's preview (else on its screen); null where there's no panel. */
+export const OpenBotLocal = createContext<((botId: string, url: string) => void) | null>(null);
+
+/**
+ * The session an app's preview loads in: its own, per Bops user, workspace, app, site and copy (`bot`: a bot's copy
+ * of the app), so its cookies, storage and service workers never mix with another app's, another site's of it or
+ * another copy's (each on its own localhost port, and cookies don't go by port), a web tab's, or the window's (whose
+ * cookie is on localhost too). The app's own site of its own folder keeps the name it always had, so a sign in there
+ * stays.
+ */
+export const previewPartition = (user: string | undefined, ws: string, app: string, site?: string, bot?: string) =>
+  `persist:bops-preview-${[user || "me", ws, app, ...(site && site !== app ? [site] : []), ...(bot ? [`by_${bot}`] : [])].map((x) => x.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 40)).join("-")}`;
+
+/** Whether this is the Mac app (Electron): web pages open in webviews, and apps the bots made run in one of their own (made-apps.tsx). */
+export const electron = () => typeof navigator !== "undefined" && navigator.userAgent.includes("Electron");
 
 export const hostOf = (url: string) => {
   try {
@@ -108,16 +157,19 @@ export function TabBar({
       {all.map((t) => (
         <Tab key={t.id} state={state} tab={t} on={t.id === active} closable={t.id !== CHAT_TAB} onPick={() => onPick(t.id)} onClose={() => onClose(t.id)} />
       ))}
-      <button
-        onClick={onNew}
-        title="New tab"
-        aria-label="New tab"
-        className="flex size-7 shrink-0 items-center justify-center rounded-lg text-[#6B6B6B] hover:bg-[#EEEEEC] hover:text-ink [-webkit-app-region:no-drag]"
-      >
-        <svg width="13" height="13" viewBox="0 0 14 14">
-          <path d="M7 2v10M2 7h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-      </button>
+      {/* A workspace shared with the user: its New tab page lists the owner's things to open as if they were the viewer's (no new tab there). */}
+      {!readOnly(state) && (
+        <button
+          onClick={onNew}
+          title="New tab"
+          aria-label="New tab"
+          className="flex size-7 shrink-0 items-center justify-center rounded-lg text-[#6B6B6B] hover:bg-[#EEEEEC] hover:text-ink [-webkit-app-region:no-drag]"
+        >
+          <svg width="13" height="13" viewBox="0 0 14 14">
+            <path d="M7 2v10M2 7h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }
@@ -129,18 +181,29 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
     shownTabs.add(t.id);
   }, [t.id]);
   const b = "botId" in t ? state.bots.find((x) => x.id === t.botId) : undefined;
-  // A computer tab says when its bot is working, or when something there needs you.
+  // An app on the web is named as its Ingot repo is.
+  const hosted = t.kind === "hosted-app" || t.kind === "preview" ? { id: `${t.ws}/${t.name}`, title: t.name } : undefined;
+  // A computer tab says when its bot is working, or when something there needs you. Your Mac's never for
+  // the owner's work in a workspace shared with the user: that's the owner's Mac, not the viewer's.
   const working =
     (t.kind === "computer" && state.sessions.some((s) => s.botId === t.botId && live(s) && s.runsOn !== "mac")) ||
-    (t.kind === "mac" && state.sessions.some((s) => s.runsOn === "mac" && live(s)));
+    (t.kind === "mac" && !state.shared && state.sessions.some((s) => s.runsOn === "mac" && live(s)));
   const needsYou =
-    // (A watched web page has no screen there: its news shows on Autopilot instead.)
-    t.kind === "computer" && (state.watches?.some((w) => w.botId === t.botId && !w.page && w.alert) || state.sessions.some((s) => s.botId === t.botId && live(s) && s.blocker));
+    // (A watched web page has no screen there: its news shows on Autopilot instead.) Never in a shared
+    // workspace: what waits there waits on its owner, never the viewer.
+    !state.shared &&
+    t.kind === "computer" &&
+    (state.watches?.some((w) => w.botId === t.botId && !w.page && w.alert) || state.sessions.some((s) => s.botId === t.botId && live(s) && s.blocker));
   // The computer it works on: its own, or the main bot's it shares (lib/screens.ts), named for whose it is.
   const host = b ? computerOf(state, b) : undefined;
   const label =
     t.kind === "computer"
-      ? host && host.id !== b?.id
+      ? // A shared workspace's computers are its owner's, whichever bot's name the owner's Bops gives them.
+        state.shared
+        ? b?.runsOn === "mac"
+          ? "Owner's Mac"
+          : "Owner's computer"
+        : host && host.id !== b?.id
         ? `${host.name}'s computer`
         : `${b?.name ?? "Bot"}'s computer`
       : t.kind === "bot"
@@ -148,8 +211,14 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
         : t.kind === "web"
           ? t.title || hostOf(t.url)
           : t.kind === "vault"
-            ? "Vault"
-            : t.kind === "mac"
+            ? "Logins"
+            : t.kind === "made-app"
+              ? (state.madeApps?.find((a) => a.id === t.appId)?.title ?? "App")
+              : t.kind === "made-apps"
+                ? appsName(state)
+                : hosted
+                  ? hosted.title
+                : t.kind === "mac"
               ? "Your Mac"
               : t.kind === "crm"
                 ? t.file
@@ -162,9 +231,9 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
     <div
       onClick={onPick}
       onAuxClick={(e) => e.button === 1 && closable && onClose()}
-      title={t.kind === "web" ? t.url : label}
+      title={t.kind === "web" ? t.url : t.kind === "preview" ? `${label}, ${t.url.replace(/^http:\/\//, "").replace(/\/$/, "")}` : label}
       // Clipped, so what's in a tab stays inside it while it opens up.
-      className={`group/tab flex h-[30px] min-w-0 max-w-[220px] shrink cursor-default items-center gap-1.5 overflow-hidden rounded-[10px] pl-2.5 ${closable ? "pr-1" : "pr-3"} text-[13px] leading-4 transition-[background-color,box-shadow,color] duration-150 ease-out motion-reduce:transition-none [-webkit-app-region:no-drag] ${
+      className={`group/tab flex h-[30px] min-w-0 max-w-[220px] shrink cursor-pointer items-center gap-1.5 overflow-hidden rounded-[10px] pl-2.5 ${closable ? "pr-1" : "pr-3"} text-[13px] leading-4 transition-[background-color,box-shadow,color] duration-150 ease-out motion-reduce:transition-none [-webkit-app-region:no-drag] ${
         opening ? "motion-tab-in" : ""
       } ${on ? "bg-white text-ink shadow-[0_0_0_1px_#0000000F,0_2px_6px_-3px_#00000026]" : "text-[#6B6B6B] hover:bg-[#EEEEEC]"}`}
     >
@@ -182,12 +251,20 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
         <KnowledgeIcon />
       ) : t.kind === "autopilot" ? (
         <AutopilotIcon />
+      ) : t.kind === "made-app" ? (
+        <AppMark app={state.madeApps?.find((a) => a.id === t.appId) ?? { id: t.appId, title: "App" }} size={15} />
+      ) : hosted ? (
+        <AppMark app={hosted} size={15} />
+      ) : t.kind === "made-apps" ? (
+        <AppsIcon />
       ) : (
         <GlobeIcon />
       )}
       <span className={`truncate ${on ? "font-medium" : ""}`}>{label}</span>
       {needsYou ? (
         <span className="size-[7px] shrink-0 rounded-full bg-highlighter shadow-[0_0_0_1.5px_#0A0A0A]" title="Needs you" />
+      ) : t.kind === "made-app" && state.madeApps?.find((a) => a.id === t.appId)?.building ? (
+        <span className="size-[7px] shrink-0 animate-pulse rounded-full bg-highlighter shadow-[0_0_0_1.5px_#0A0A0A]" title="Building" />
       ) : working ? (
         <span className="size-[6px] shrink-0 animate-pulse rounded-full bg-[#2BB673]" title="Working" />
       ) : null}
@@ -338,6 +415,7 @@ export function NewTab({
   onProfile,
   onVault,
   onKnowledge,
+  onApps,
   onMac,
 }: {
   state: AppState;
@@ -347,6 +425,8 @@ export function NewTab({
   onVault: () => void;
   /** Knowledge, what the bots know (memory-categories.tsx); none where it isn't open to this account. */
   onKnowledge?: () => void;
+  /** The apps the bots made (made-apps.tsx); none where apps aren't open to this account (lib/apps-access.ts). */
+  onApps?: () => void;
   onMac: () => void;
 }) {
   const [address, setAddress] = useState("");
@@ -413,14 +493,25 @@ export function NewTab({
         )}
       </form>
       <div className="flex w-full max-w-[520px] flex-col gap-2">
+        {onApps && (
+          <button onClick={onApps} className="mb-2 flex items-center gap-2.5 rounded-2xl px-3 py-2.5 text-left shadow-[0_0_0_1px_#ECECEA] hover:bg-[#FCFCFB]">
+            <span className="flex size-7 items-center justify-center rounded-full bg-ink text-highlighter">
+              <AppsIcon size={13} />
+            </span>
+            <span className="flex flex-col">
+              <span className="text-[14px] font-medium leading-[18px]">{appsName(state)}</span>
+              <span className="text-[12px] leading-4 text-[#6B6B6B]">{state.shared ? appsLine(state) : "Tools your bots made for you"}</span>
+            </span>
+          </button>
+        )}
         <button onClick={onVault} className="mb-2 flex items-center gap-2.5 rounded-2xl px-3 py-2.5 text-left shadow-[0_0_0_1px_#ECECEA] hover:bg-[#FCFCFB]">
           <span className="flex size-7 items-center justify-center rounded-full bg-ink text-highlighter">
             <KeyIcon />
           </span>
           <span className="flex flex-col">
-            <span className="text-[14px] font-medium leading-[18px]">Vault</span>
+            <span className="text-[14px] font-medium leading-[18px]">Logins</span>
             <span className="text-[12px] leading-4 text-[#6B6B6B]">
-              Your apps and logins, and which bots can use them
+              Your accounts and logins, and which bots can use them
             </span>
           </span>
         </button>

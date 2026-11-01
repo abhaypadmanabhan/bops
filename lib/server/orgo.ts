@@ -2,12 +2,16 @@ import "server-only";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { orgoHeaders } from "./app-version";
-import { loadOrgoKey, orgoOrigin } from "./orgo-auth";
+import { loadOrgoKey, orgoKeyRejected, orgoOrigin } from "./orgo-auth";
+import { onRunner } from "./persist";
 import { RTC_SHRUNK_MS } from "@/lib/rtc";
 import { recordUsage } from "./usage";
 import { getState, stateEpoch, update } from "./store";
 import { MAIN_WORKSPACE, WORKSPACE_APPS_SINCE, type Workspace } from "@/lib/types";
+import type { DeployState } from "@/lib/hosted-apps";
+import type { SharedRole, SharedWorkspace } from "@/lib/shared";
 import { folderKey, moveWorkspaceFolder } from "./workspace-skills";
+import { isIdentityToken } from "./vm-identity";
 
 /** Thin Orgo REST client (the published SDKs predate screens and clone). */
 
@@ -15,11 +19,15 @@ const base = () => `${orgoOrigin()}/api`;
 
 /**
  * The key Orgo calls run on: the signed-in user's (Sign in with Orgo, kept in the Keychain), else
- * ORGO_API_KEY (self-hosting), else the Orgo CLI's login in ~/.orgo/credentials.json.
+ * ORGO_API_KEY (self-hosting), else the Orgo CLI's login in ~/.orgo/credentials.json. A computer's runner
+ * uses only its computer's own credential: its Orgo identity, else its key read from the files Orgo
+ * writes it in (orgo-auth.ts runnerKey): never one from its environment or a CLI login on that computer,
+ * which may be anyone's.
  */
 export async function apiKey(): Promise<string> {
   const signedIn = await loadOrgoKey();
   if (signedIn) return signedIn;
+  if (onRunner()) throw new Error("No ORGO_API_KEY on this computer");
   if (process.env.ORGO_API_KEY) return process.env.ORGO_API_KEY;
   try {
     const creds = JSON.parse(readFileSync(`${homedir()}/.orgo/credentials.json`, "utf8"));
@@ -31,16 +39,22 @@ export async function apiKey(): Promise<string> {
   throw new Error("Not signed in to Orgo");
 }
 
-/** Orgo turned a call down: its HTTP status, its code when it sent one (VM_SLOT_ADDON, NOT_FORKABLE…), and its own words. */
+/**
+ * Orgo turned a call down: its HTTP status, its code when it sent one (VM_SLOT_ADDON, NOT_FORKABLE…), its
+ * own words, and the rest of what it answered (`answer`: the field a DNS record got wrong, the computer a
+ * name points at), for a caller that says more than the words.
+ */
 export class OrgoError extends Error {
   status: number;
   code?: string;
   said?: string;
-  constructor(message: string, status: number, code?: string, said?: string) {
+  answer?: Record<string, unknown>;
+  constructor(message: string, status: number, code?: string, said?: string, answer?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
     this.said = said;
+    this.answer = answer;
   }
 }
 
@@ -92,21 +106,35 @@ const MAKE_MS = 180_000;
 /** Orgo didn't answer in time (the connection dropped, or it hung): the call may or may not have been done. */
 export class OrgoTimeout extends Error {}
 
+/** Orgo's code in an answer (a 401's says why an identity token was turned down), read from a copy so the answer itself is still unread. */
+async function codeOf(res: Response): Promise<string | undefined> {
+  try {
+    const j = (await res.clone().json()) as { code?: unknown } | null;
+    return typeof j?.code === "string" ? j.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * One request to Orgo with the signed-in key, read with `read`, within `timeoutMs` (OrgoTimeout after) or
  * until `signal` (a task stopped), which ends it as the signal says. A network error comes as Node gave it.
+ * Says which key went, so a caller can tell a runner's identity token was turned down.
  */
 async function answered<R>(url: string, init: RequestInit, timeoutMs: number, signal: AbortSignal | undefined, read: (res: Response) => Promise<R>) {
   if (signal?.aborted) throw signal.reason ?? new Error("Stopped");
   const timer = AbortSignal.timeout(timeoutMs);
   try {
+    const key = await apiKey();
     const res = await fetch(url, {
       ...init,
-      headers: { ...orgoHeaders(), ...(init.headers as Record<string, string>), Authorization: `Bearer ${await apiKey()}` },
+      headers: { ...orgoHeaders(), ...(init.headers as Record<string, string>), Authorization: `Bearer ${key}` },
       cache: "no-store",
       signal: signal ? AbortSignal.any([timer, signal]) : timer,
     });
-    return { res, text: await read(res) };
+    // A runner's credential turned down: its computer may have a new key, or a fresh token (orgo-auth.ts).
+    if (res.status === 401) orgoKeyRejected(key, await codeOf(res));
+    return { res, text: await read(res), key };
   } catch (e) {
     if (signal?.aborted) throw signal.reason ?? new Error("Stopped");
     if (timer.aborted) throw new OrgoTimeout(`Orgo didn't answer within ${Math.round(timeoutMs / 1000)} seconds`);
@@ -128,14 +156,21 @@ async function call<T>(
   { wait = method === "POST" || method === "PATCH", timeoutMs = CALL_MS, signal }: { wait?: boolean; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<T> {
   const until = Date.now() + wakeWaitMs();
+  let reauthed = false;
   for (let attempt = 0; ; attempt++) {
-    let res: Response, text: string;
+    let res: Response, text: string, key: string;
     try {
-      ({ res, text } = await answered(`${base()}${path}`, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) }, timeoutMs, signal, async (r) => r.text()));
+      ({ res, text, key } = await answered(`${base()}${path}`, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) }, timeoutMs, signal, async (r) => r.text()));
     } catch (e) {
       // A read that didn't get through is safe to make again, once; an action may have happened, so it says so instead.
       if (method === "GET" && attempt === 0 && !signal?.aborted) continue;
       throw e;
+    }
+    // A runner's identity token turned down (its computer woke on another VM, say): once more on the
+    // credential it takes next, at once (orgo-auth.ts). A 401 is answered before anything is done.
+    if (res.status === 401 && !reauthed && isIdentityToken(key)) {
+      reauthed = true;
+      continue;
     }
     let json: { error?: string; code?: unknown; retry_after?: unknown } = {};
     try {
@@ -163,6 +198,7 @@ async function call<T>(
         res.status,
         code,
         typeof json.error === "string" ? json.error : undefined,
+        json && typeof json === "object" && !Array.isArray(json) ? json : undefined,
       );
     return json as T;
   }
@@ -171,22 +207,33 @@ async function call<T>(
 /**
  * One call to Orgo with `key`, the key passed in and only that (never apiKey's fallbacks): its status and
  * JSON (an empty object when it had none), or null when it didn't answer within `timeoutMs`. `headers` go
- * along (an Idempotency-Key), never in place of the key. `path` starts with /api.
+ * along (an Idempotency-Key, an If-Match), never in place of the key. `raw`: a body sent as it is with its
+ * own type (an app's data as the Mac wrote it, a CRM file's CSV) instead of `body` as JSON. `path` starts
+ * with /api.
  */
 export async function callOrgo<T>(
   key: string,
   path: string,
-  { method = "GET", body, headers, timeoutMs = 15_000 }: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
+  {
+    method = "GET",
+    body,
+    raw,
+    headers,
+    timeoutMs = 15_000,
+  }: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; raw?: { data: string | Uint8Array; type: string }; headers?: Record<string, string>; timeoutMs?: number } = {},
 ): Promise<{ status: number; json: T } | null> {
   try {
+    const type: Record<string, string> = raw ? { "Content-Type": raw.type } : body === undefined ? {} : { "Content-Type": "application/json" };
     const res = await fetch(`${orgoOrigin()}${path}`, {
       method,
-      headers: { ...orgoHeaders(), ...headers, Authorization: `Bearer ${key}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      headers: { ...orgoHeaders(), ...headers, Authorization: `Bearer ${key}`, ...type },
+      ...(raw ? { body: raw.data as BodyInit } : body === undefined ? {} : { body: JSON.stringify(body) }),
       cache: "no-store",
       signal: AbortSignal.timeout(timeoutMs),
     });
-    return { status: res.status, json: (await res.json().catch(() => ({}))) as T };
+    const json = (await res.json().catch(() => ({}))) as T;
+    if (res.status === 401) orgoKeyRejected(key, typeof (json as { code?: unknown })?.code === "string" ? (json as { code: string }).code : undefined);
+    return { status: res.status, json };
   } catch {
     return null;
   }
@@ -244,8 +291,22 @@ export type OrgoComputer = { id: string; name: string; status: string; cpu: numb
  * the next user never lands in the last one's workspace.
  */
 const WORKSPACE = "bops";
-/** A workspace as GET /api/workspaces lists it. `product` and `bops_ws_id` only from an orgo-web with per workspace projects. */
-export type OrgoWorkspace = { id: string; name: string; role?: string; product?: string | null; bops_ws_id?: string | null; created_at?: string; updated_at?: string | null; desktops?: { id: string; name?: string }[]; member_count?: number };
+/**
+ * A workspace as GET /api/workspaces lists it. `product` and `bops_ws_id` only from an orgo-web with per
+ * workspace projects; `owner_email` is its owner's (one shared with the user names who shared it).
+ */
+export type OrgoWorkspace = {
+  id: string;
+  name: string;
+  role?: string;
+  product?: string | null;
+  bops_ws_id?: string | null;
+  owner_email?: string | null;
+  created_at?: string;
+  updated_at?: string | null;
+  desktops?: { id: string; name?: string }[];
+  member_count?: number;
+};
 const g = globalThis as unknown as {
   bopsOrgoWorkspace?: Promise<string>;
   bopsComputerChanges?: number;
@@ -285,6 +346,18 @@ export const ownedWorkspaces = async () => {
   notePerWorkspace(list, await apiKey().catch(() => ""));
   return list;
 };
+
+/**
+ * The Bops workspaces others shared with the user (lib/shared.ts): ones they're an admin or a member of,
+ * each its own Bops workspace (bops_ws_id), so being in it shows that workspace alone. An Orgo without
+ * per workspace projects has none: its one "bops" project holds every workspace of its owner's.
+ */
+export async function sharedWorkspaces(): Promise<SharedWorkspace[]> {
+  const list = (await call<{ workspaces?: OrgoWorkspace[] }>("GET", "/workspaces")).workspaces ?? [];
+  return list
+    .filter((w) => (w.role === "admin" || w.role === "member") && w.product === "bops" && typeof w.bops_ws_id === "string" && !!w.bops_ws_id)
+    .map((w) => ({ projectId: w.id, name: w.name, owner: typeof w.owner_email === "string" ? w.owner_email : "", role: w.role as SharedRole }));
+}
 
 /**
  * What a list says about this Orgo. `product` on a project shows only the column (GET answers every column,
@@ -447,7 +520,7 @@ export const collisionNames = (name: string) => [name, `${name} (Bops)`, ...Arra
  * already has is said back (OrgoError, nameTaken) for them to pick another; otherwise the next free one
  * of collisionNames is used and noted.
  */
-export async function ensureProject(wsId: string, opts: { interactive?: boolean; name?: string } = {}): Promise<{ id: string; name: string; renamed?: boolean; created?: boolean }> {
+export async function ensureProject(wsId: string, opts: { interactive?: boolean; name?: string } = {}): Promise<{ id: string; name: string; updatedAt?: string; renamed?: boolean; created?: boolean }> {
   const w = workspaceOfId(wsId);
   const local = (opts.name ?? w?.name ?? "Workspace").trim().slice(0, 80) || "Workspace";
   const owned = await ownedWorkspaces();
@@ -456,7 +529,7 @@ export async function ensureProject(wsId: string, opts: { interactive?: boolean;
     // Tied here only once Orgo tied it too (a refusal, a 409 taken by another, or an orgo-web without the code: nothing).
     if (tied.bops_ws_id !== wsId && !(await tieProject(tied.id, wsId))) throw new Error(`Orgo didn't tie ${tied.id.slice(0, 8)} to this workspace`);
     bindProject(wsId, tied.id, tied.name, tied.updated_at);
-    return { id: tied.id, name: tied.name };
+    return { id: tied.id, name: tied.name, ...(tied.updated_at ? { updatedAt: tied.updated_at } : {}) };
   }
   const name = wsId === MAIN_WORKSPACE && /^main$/i.test(local) ? WORKSPACE : local;
   const tries = opts.interactive ? [name] : collisionNames(name);
@@ -467,7 +540,7 @@ export async function ensureProject(wsId: string, opts: { interactive?: boolean;
   for (const n of tries) {
     if (!opts.interactive && taken.has(n.toLowerCase())) continue;
     try {
-      const made = await call<{ id: string; name?: string; product?: unknown; bops_ws_id?: unknown; updated_at?: string | null }>("POST", "/workspaces", { name: n, product: "bops", bops_ws_id: wsId }, { wait: false });
+      const made = await call<{ id: string; name?: string; product?: unknown; bops_ws_id?: unknown; created_at?: string | null; updated_at?: string | null }>("POST", "/workspaces", { name: n, product: "bops", bops_ws_id: wsId }, { wait: false });
       if (!saidBack(made, wsId)) {
         // An orgo-web without the code made a plain Orgo project: it goes again, and this workspace stays on the "bops" project.
         if (g.bopsOrgoPerWorkspace) g.bopsOrgoPerWorkspace.on = null;
@@ -475,15 +548,17 @@ export async function ensureProject(wsId: string, opts: { interactive?: boolean;
         throw new Error("Orgo didn't make it a Bops workspace");
       }
       await confirmPerWorkspace();
-      bindProject(wsId, made.id, made.name ?? n, made.updated_at);
-      return { id: made.id, name: made.name ?? n, created: true, ...(n !== name ? { renamed: true } : {}) };
+      // orgo-web's create answers created_at, not updated_at: a project just made was last changed then.
+      const at = made.updated_at ?? made.created_at ?? undefined;
+      bindProject(wsId, made.id, made.name ?? n, at);
+      return { id: made.id, name: made.name ?? n, created: true, ...(at ? { updatedAt: at } : {}), ...(n !== name ? { renamed: true } : {}) };
     } catch (e) {
       if (!nameTaken(e) || opts.interactive) throw e;
       // Made meanwhile (another Mac): that's it, if it's tied to this workspace.
       const again = (await ownedWorkspaces()).find((x) => x.bops_ws_id === wsId);
       if (again) {
         bindProject(wsId, again.id, again.name, again.updated_at);
-        return { id: again.id, name: again.name };
+        return { id: again.id, name: again.name, ...(again.updated_at ? { updatedAt: again.updated_at } : {}) };
       }
     }
   }
@@ -525,8 +600,8 @@ export async function bopsProjects(): Promise<string[]> {
 /**
  * A workspace the user owns, to read their plan's numbers by (Orgo counts computers against the owner,
  * across every workspace they own): the "bops" one when there is one, else any. Unlike bopsWorkspace it
- * never makes one, so reading the plan leaves nothing behind in an account that never used the cloud.
- * Null when they own none.
+ * never makes one, so reading the plan makes nothing (the "bops" one is made by bindMissingProjects at
+ * sign-in or start, in workspaces.ts, or with the first computer). Null when they own none.
  */
 export async function ownedWorkspace(): Promise<string | null> {
   const bops = await g.bopsOrgoWorkspace?.catch(() => undefined);
@@ -550,7 +625,8 @@ export type BopsWorkspaceFound =
  * The user's own "bops" workspace, found and never made, with `key` (theirs, signed in): the id
  * bopsWorkspace() already has for them (unless `fresh`), else the one they own named "bops" (any case,
  * spaces trimmed). Never one shared with them, never another of theirs (unlike ownedWorkspace), and
- * nothing is made (unlike bopsWorkspace): "none" until a bot of theirs has had a computer. The people
+ * nothing is made (unlike bopsWorkspace): "none" until Bops made it (workspaces.ts bindMissingProjects at
+ * sign-in or start, every account signed in to Bops, or a bot's first computer). The people
  * the user adds are this workspace's members (lib/server/members.ts).
  */
 export async function findBopsWorkspace(key: string, { fresh = false, wsId }: { fresh?: boolean; wsId?: string } = {}): Promise<BopsWorkspaceFound> {
@@ -574,7 +650,8 @@ export async function findBopsWorkspace(key: string, { fresh = false, wsId }: { 
 }
 
 /** A member of a workspace as orgo-web lists it: the owner first, then everyone else (guests have no email). */
-export type OrgoMember = { id?: unknown; alt?: unknown; role?: unknown; email?: unknown };
+/** A member as orgo-web lists them (`joined_at`: when their membership began, from an orgo-web that sends it). */
+export type OrgoMember = { id?: unknown; alt?: unknown; role?: unknown; email?: unknown; joined_at?: unknown };
 /** An invite as orgo-web lists it (the token only for the owner; the times from an orgo-web that sends them). */
 export type OrgoInvite = { email?: unknown; role?: unknown; status?: unknown; token?: unknown; created_at?: unknown; expires_at?: unknown; expired?: unknown };
 
@@ -611,12 +688,12 @@ export const orgoMembers = {
  * is made from (orgo-web lib/curated-templates.ts). BOPS_ORGO_TEMPLATE points at your own build
  * when the default isn't in your Orgo account.
  */
-export const BOPS_TEMPLATE = process.env.BOPS_ORGO_TEMPLATE || "system/bops-base@0.1.8";
+export const BOPS_TEMPLATE = process.env.BOPS_ORGO_TEMPLATE || "system/bops-base@0.1.11";
 /**
- * Every Bops computer's disk, in GB (Orgo's plan default is 20). Copies inherit their source's disk,
- * and older computers grow to this the next time Bops gets them ready (see growDisk).
+ * Every Bops computer's disk, in GB: what Orgo makes them with (orgo-web BOPS_COMPUTER_DISK_GB) and grows
+ * older ones to when they wake. Copies inherit their source's disk; growDisk asks for no more than Orgo allows.
  */
-export const BOPS_DISK_GB = Number(process.env.BOPS_DISK_GB) || 120;
+export const BOPS_DISK_GB = Number(process.env.BOPS_DISK_GB) || 80;
 /** Every screen on a Bops computer: 4:3, like the template's boot screen (orgo/bops-base.mjs). */
 export const BOPS_SCREEN = { width: 1280, height: 960 };
 
@@ -902,6 +979,12 @@ export type OrgoDeletePreview = {
   keys: string[];
   skills: string[];
   apps: string[];
+  /** The apps its bots made and its CRM files, by name (an orgo-web that keeps them: madeApps [{ title }], crmFiles [{ name }]). */
+  madeApps: string[];
+  crmFiles: string[];
+  /** Its routines and Orbit issues, by title, from an orgo-web that lists them (routines [{ title }], orbitIssues [{ title }]); none from one that doesn't (Bops lists its own). */
+  routines: string[];
+  issues: string[];
   /** An orgo-web that counted skills and apps (563ed1cf6) instead of naming them: how many it has, names unknown. */
   skillCount?: number;
   appCount?: number;
@@ -926,6 +1009,10 @@ export async function deletePreview(projectId: string): Promise<OrgoDeletePrevie
     keys: names(j.keys ?? j.secrets),
     skills: names(j.skills),
     apps: names(j.apps),
+    madeApps: names(j.madeApps),
+    crmFiles: names(j.crmFiles),
+    routines: names(j.routines),
+    issues: names(j.orbitIssues ?? j.issues),
     ...(count(j.skills) !== undefined && { skillCount: count(j.skills) }),
     ...(count(j.apps) !== undefined && { appCount: count(j.apps) }),
   };
@@ -934,12 +1021,28 @@ export async function deletePreview(projectId: string): Promise<OrgoDeletePrevie
 /** The first Bops release that finds its default workspace by bops_ws_id, not by the name "bops" (lib/types.ts). */
 export { WORKSPACE_APPS_SINCE };
 
-const olderVersion = (a: string, b: string) => {
+/** Whether version a ("0.0.31") is older than b. */
+export const olderVersion = (a: string, b: string) => {
   const x = a.split(".").map(Number);
   const y = b.split(".").map(Number);
   for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i];
   return false;
 };
+
+/**
+ * The Bops version each app on the account last sent (GET /api/bops/apps, as bopsAppsGate reads it; never Bops
+ * Cloud's), the ones that sent one; null when Orgo doesn't say (signed out, an orgo-web without the route, Orgo
+ * not answering).
+ */
+export async function bopsAppVersions(): Promise<string[] | null> {
+  const key = await apiKey().catch(() => "");
+  if (!key) return null;
+  const r = await callOrgo<{ apps?: unknown }>(key, "/api/bops/apps");
+  if (!r || r.status !== 200 || !Array.isArray(r.json.apps)) return null;
+  return (r.json.apps as { app_version?: unknown; caller?: unknown }[])
+    .filter((a) => a && typeof a === "object" && a.caller !== "cloud")
+    .flatMap((a) => (typeof a.app_version === "string" && /^v?\d+\.\d+\.\d+$/i.test(a.app_version.trim()) ? [a.app_version.trim().replace(/^v/i, "")] : []));
+}
 
 /**
  * Whether every Bops app on this account is new enough for the default's project to take the user's
@@ -984,6 +1087,20 @@ export const projectComputers = async (projectId: string) => (await call<{ deskt
  */
 export const computerAsleepError = (e: unknown) => e instanceof OrgoError && e.status === 409 && e.code === "computer_asleep";
 
+/** A computer's SSH as orgo-web says it: on or off, and where it's reached (`ipv4_host`:`ipv4_port`, null until it's on). */
+export type OrgoSsh = { enabled: boolean; authorized_key_set: boolean; ipv4_host: string | null; ipv4_port: number | null; ssh_user?: string | null; ssh_command: string | null; ipv6_address?: string | null };
+
+/**
+ * orgo-web's SSH of a computer (app/api/computers/[id]/ssh): sshd there takes keys only, on a port of its host's
+ * own. Turning it on with a key (`on`) writes the computer's authorized_keys whole with that key alone, there and on
+ * its every start, so computer-ssh.ts sends it only while SSH is off. Neither wakes the computer.
+ */
+export const computerSsh = {
+  get: (computerId: string) => call<OrgoSsh>("GET", `/computers/${encodeURIComponent(computerId)}/ssh`, undefined, { wait: false }),
+  on: (computerId: string, publicKey: string) =>
+    call<{ enabled?: boolean; ssh_host_port?: number | null; pending?: boolean }>("POST", `/computers/${encodeURIComponent(computerId)}/ssh`, { public_key: publicKey }, { wait: false }),
+};
+
 /** A device paired to route computers' browsing through it (Orgo's personal-device egress). */
 export type OrgoEgressDevice = { id: string; name: string; online: boolean | null; computers?: unknown };
 
@@ -1011,6 +1128,323 @@ export const egress = {
 
 /** Orgo said a feature isn't available for this account (403). */
 export const orgoUnavailable = (e: unknown) => / → 403:/.test((e as Error)?.message ?? "");
+
+/**
+ * One deploy as orgo-web's deploy runner has it (DeploymentView). An app's names the Ingot changeset it
+ * builds (`at`; `source_version` or `commit_sha` where orgo-web says it so).
+ */
+export type OrgoDeployment = {
+  id: string;
+  project_id: string;
+  state: DeployState;
+  /** Why it ran: by hand, a changeset built again, or an earlier release put back (rollback). */
+  trigger?: string;
+  /** Its release is the one live now (through it, or another deploy of the same release). */
+  release_live?: boolean;
+  /** Its release is still on the computer and isn't the live one: a rollback can put it back without a build. */
+  can_rollback?: boolean;
+  phase?: string | null;
+  error?: string | null;
+  at?: string | null;
+  source_version?: string | null;
+  commit_sha?: string | null;
+  created_at: string;
+  finished_at?: string | null;
+};
+
+/** A deploy project on one computer (ProjectView): an app's has Ingot as its source (its repo there), and its public URL once it was live. */
+export type OrgoDeployProject = {
+  id: string;
+  name: string;
+  source?: string;
+  /** Its GitHub repository (owner/name): null for an app's. */
+  repo?: string | null;
+  /** The Ingot repo it builds (source "ingot"), as "<project>/<name>". */
+  ingot_repo?: string | null;
+  /** The changeset every deploy that names none builds, when one is kept (Bops keeps none: those build the newest on main). */
+  ingot_at?: string | null;
+  url: string | null;
+  /** The port its app listens on there (each project on a computer has its own). */
+  port?: number;
+  /** Its commands (null: Orgo finds them). */
+  install_cmd?: string | null;
+  build_cmd?: string | null;
+  start_cmd?: string | null;
+  /** The path Orgo asks for to tell a new release answers, before it puts it live ("/" by default). */
+  health_path?: string;
+  /** Its variables' names (never their values). */
+  env_keys?: string[];
+  current?: OrgoDeployment | null;
+  deployments?: OrgoDeployment[];
+};
+
+/** A deploy's build log after `after` (GET …/deployments/{id}/logs): `next` reads on from there, `more` when there's more already. */
+export type OrgoDeployLog = { state: DeployState; phase?: string | null; error?: string | null; log: string; next: number; more: boolean };
+
+/** The Ingot changeset a deploy builds, however orgo-web names it (null: it doesn't say). */
+export const deployedAt = (d: Pick<OrgoDeployment, "at" | "source_version" | "commit_sha"> | null | undefined) => d?.at ?? d?.source_version ?? d?.commit_sha ?? null;
+
+/**
+ * What a deploy route answers: its answer, or `enabled` false with why, when orgo-web says hosting isn't
+ * open to this account (404 DEPLOYS_DISABLED or SERVICES_DISABLED: HOSTING_ACCESS keeps it to admins, or
+ * deploys are off there). Anything else Orgo turns down throws its OrgoError.
+ */
+export type Hosting<T> = { enabled: true; value: T } | { enabled: false; why: string };
+
+export const HOSTING_CLOSED = "Hosting apps on the web isn't open to your Orgo account yet.";
+
+async function hostingCall<T>(method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<Hosting<T>> {
+  try {
+    return { enabled: true, value: await call<T>(method, path, body, { wait: false }) };
+  } catch (e) {
+    if (e instanceof OrgoError && e.status === 404 && (e.code === "DEPLOYS_DISABLED" || e.code === "SERVICES_DISABLED")) return { enabled: false, why: HOSTING_CLOSED };
+    throw e;
+  }
+}
+
+/**
+ * orgo-web's deploy runner (lib/deploys), with the user's key: apps a workspace runs on the web. A project
+ * is one app on one computer, built from one changeset of its Ingot repo on that computer (source "ingot":
+ * the runner there exports it with `ingot export`), and reached at its public URL (<name>.orgo.dev) once
+ * its first deploy is live. Nothing here calls the computer: Orgo queues a deploy and builds it once the
+ * computer runs.
+ */
+export const deploys = {
+  /** The computer's deploy projects, each with its newest deploys. */
+  projects: (computerId: string) => hostingCall<{ projects?: OrgoDeployProject[] }>("GET", `/computers/${encodeURIComponent(computerId)}/deploy-projects`),
+  /** One project, with its newest deploys. */
+  project: (computerId: string, projectId: string) => hostingCall<OrgoDeployProject>("GET", `/computers/${encodeURIComponent(computerId)}/deploy-projects/${encodeURIComponent(projectId)}`),
+  /**
+   * A new project for an app (its Ingot repo, "<project>/<name>", on that computer), named for its public URL, its app listening
+   * on `port` (one no other project or app on that computer has). It names no changeset: one named here
+   * would be kept (ingot_at) and built by every deploy that names none after it. Nothing is deployed yet:
+   * deploy queues that. `env`: its variables, saved with it (Orgo keeps them encrypted), so its first build
+   * has them; sent only when there are some.
+   */
+  create: (computerId: string, app: { repo: string; name: string; port: number; env?: Record<string, string>; publicUrl?: false }) =>
+    hostingCall<OrgoDeployProject>("POST", `/computers/${encodeURIComponent(computerId)}/deploy-projects`, {
+      source: "ingot",
+      repo: app.repo,
+      name: app.name,
+      port: app.port,
+      deploy: false,
+      ...(app.env && Object.keys(app.env).length ? { env: app.env } : {}),
+      // (No public URL of its own: a Published site lives on its domains only. An orgo-web without the flag ignores it.)
+      ...(app.publicUrl === false ? { public_url: false } : {}),
+    }),
+  /** Queue a deploy of one changeset (none: the newest on main). A newer deploy replaces one still queued. */
+  deploy: (computerId: string, projectId: string, at?: string) =>
+    hostingCall<OrgoDeployment>("POST", `/computers/${encodeURIComponent(computerId)}/deploy-projects/${encodeURIComponent(projectId)}/deployments`, at ? { at } : {}),
+  /**
+   * Change what of a project can be changed (orgo-web PATCH: its name is fixed): its port (its app and its
+   * public URL move, and the live release is built again for it), its install, build and start commands
+   * ("" for the ones Orgo finds itself), and its health check's path. Answers the project as it is now.
+   */
+  change: (computerId: string, projectId: string, patch: { port?: number; install_cmd?: string; build_cmd?: string; start_cmd?: string; health_path?: string }) =>
+    hostingCall<OrgoDeployProject>("PATCH", `/computers/${encodeURIComponent(computerId)}/deploy-projects/${encodeURIComponent(projectId)}`, patch),
+  /**
+   * Set (a value) or remove (null) a project's variables; the rest stay. Orgo keeps the values encrypted and
+   * never gives them back: it answers their names. They apply from the next deploy on.
+   */
+  env: (computerId: string, projectId: string, env: Record<string, string | null>) =>
+    hostingCall<{ env_keys?: string[] }>("PATCH", `/computers/${encodeURIComponent(computerId)}/deploy-projects/${encodeURIComponent(projectId)}/env`, { env }),
+  /**
+   * Remove a project: its runner, containers and releases on the computer (while it runs; one asleep keeps
+   * its folder), its app there, its deployments and logs, and the public URL its deploy made. Its custom
+   * domains stay the computer's: they're removed on their own.
+   */
+  remove: (computerId: string, projectId: string) =>
+    hostingCall<{ deleted?: boolean }>("DELETE", `/computers/${encodeURIComponent(computerId)}/deploy-projects/${encodeURIComponent(projectId)}`),
+  /** Put an earlier deploy's release live again, without a build (only one that went live and is still on the computer). */
+  rollback: (computerId: string, deploymentId: string) =>
+    hostingCall<OrgoDeployment>("POST", `/computers/${encodeURIComponent(computerId)}/deployments/${encodeURIComponent(deploymentId)}/rollback`, {}),
+  /** A deploy's build log after the line `after` (0: from the start). */
+  logs: (computerId: string, deploymentId: string, after = 0) =>
+    hostingCall<OrgoDeployLog>("GET", `/computers/${encodeURIComponent(computerId)}/deployments/${encodeURIComponent(deploymentId)}/logs?after=${Math.max(0, Math.floor(after))}`),
+};
+
+/**
+ * A computer's public URL (orgo-web presentPublicUrl): https://<label>.<base domain> to one port in it. `protected`:
+ * a browser gets a password page first (absent: an orgo-web from before passwords, which can't tell).
+ */
+export type OrgoPublicUrl = { id: string; url: string; hostname: string; label: string; port: number; created_at: string; disabled?: boolean; protected?: boolean };
+
+/**
+ * A public URL's password as orgo-web keeps it (null: it has none), and the cookie a browser that typed it gets
+ * (__Host-orgo_pass, 30 days), so Bops' own view of it opens without the password page.
+ */
+export type OrgoUrlPassword = { password: string | null; cookie: { name: string; value: string } | null };
+
+/** A computer's public URLs as orgo-web lists them, with the caps (`account_used`: the owner's across their computers). */
+export type OrgoPublicUrls = { enabled: boolean; base_domain?: string; limit?: number; account_limit?: number; account_used?: number; public_urls?: OrgoPublicUrl[] };
+
+/**
+ * orgo-web's public URLs (lib/public-urls): a computer's https://<label>.orgo.dev, each to one port. Bops makes
+ * an app's Preview link with one (its label chosen by Bops, so it stays the same: app-labels.ts), before its
+ * deploy project's first deploy, so the project adopts it and never owns it. A list never wakes the computer.
+ * A write orgo-web answers 404 without a code (public URLs not open here) is HOSTING_CLOSED.
+ */
+export const publicUrls = {
+  list: (computerId: string) => hostingCall<OrgoPublicUrls>("GET", `/computers/${encodeURIComponent(computerId)}/public-urls`),
+  create: (computerId: string, port: number, label: string) =>
+    hostingCall<OrgoPublicUrl>("POST", `/computers/${encodeURIComponent(computerId)}/public-urls`, { port, label }).catch((e: unknown) =>
+      e instanceof OrgoError && e.status === 404 && !e.code ? ({ enabled: false, why: HOSTING_CLOSED } as const) : Promise.reject(e),
+    ),
+  remove: (computerId: string, urlId: string) => hostingCall<unknown>("DELETE", `/computers/${encodeURIComponent(computerId)}/public-urls/${encodeURIComponent(urlId)}`),
+  port: (computerId: string, urlId: string, port: number) =>
+    hostingCall<OrgoPublicUrl>("PATCH", `/computers/${encodeURIComponent(computerId)}/public-urls/${encodeURIComponent(urlId)}`, { port }),
+  /** Put a password on it (4 to 64 printable characters), a new one in place of the one it had, or none (null): a browser with an older cookie asks again. */
+  setPassword: (computerId: string, urlId: string, password: string | null) =>
+    hostingCall<OrgoPublicUrl>("PATCH", `/computers/${encodeURIComponent(computerId)}/public-urls/${encodeURIComponent(urlId)}`, { password }),
+  /** Its password now, and the cookie that opens it (both null when it has none). */
+  password: (computerId: string, urlId: string) =>
+    hostingCall<OrgoUrlPassword>("GET", `/computers/${encodeURIComponent(computerId)}/public-urls/${encodeURIComponent(urlId)}/password`),
+};
+
+/** A record Orgo says to set for a custom domain (dns_records): `name` in full, `host` as a DNS provider's Host field takes it. */
+export type OrgoDomainRecord = { type: string; name: string; host?: string; zone?: string | null; value: string };
+
+/**
+ * A custom domain on a computer (orgo-web lib/db/domains.ts presentDomain): the port it serves there, and
+ * whether Orgo writes its records itself (bought through Orgo). Which bought domain that is isn't said.
+ */
+export type OrgoCustomDomain = {
+  id: string;
+  domain: string;
+  status: "pending" | "verifying" | "active" | "failed" | "disabled";
+  target_port: number;
+  verified_at?: string | null;
+  cert_status?: "pending" | "issued";
+  managed?: boolean;
+  dns_records?: OrgoDomainRecord[];
+};
+
+/** A record of a bought domain's zone (orgo-web lib/domains/records.ts DnsRecordView); `managed` when Orgo wrote it for a computer. */
+export type OrgoDnsRecord = {
+  id: string;
+  type: string;
+  name: string;
+  fqdn: string;
+  value: string;
+  priority?: number;
+  weight?: number;
+  port?: number;
+  managed: null | { computer_id: string; computer_name: string | null; custom_domain_id: string };
+};
+
+/** A bought domain's zone as orgo-web reads it from its registrar. */
+export type OrgoZone = { domain: string; nameservers?: { mode: "orgo" | "custom"; list: string[] }; serving?: boolean; ttl_seconds?: number | null; records?: OrgoDnsRecord[] };
+
+/** What Orgo found when it looked up a custom domain's records (GET …/dns-check). */
+export type OrgoDnsCheck = {
+  zone?: string | null;
+  provider?: { id: string; name: string } | null;
+  records?: (OrgoDomainRecord & { status: "ok" | "missing" | "wrong" })[];
+};
+
+/** A name a search found, priced in cents of Orgo credits for its shortest term (only an available one). */
+export type OrgoDomainOffer = { domain: string; tld?: string; status: string; price_cents: number | null; renewal_cents_per_year: number | null; min_years: number | null };
+
+/** A domain the workspace bought through Orgo (orgo-web presentRegisteredDomain): never its registrant. */
+export type OrgoBoughtDomain = {
+  id: string;
+  domain: string;
+  status: string;
+  expires_at?: string | null;
+  auto_renew?: boolean;
+  renewal_cents?: number | null;
+  renewal_years?: number;
+  renewal_paid_by?: "you" | "member" | null;
+  renewal_state?: "off" | "scheduled" | "renewing" | "retrying" | "expired";
+  renewal_error?: "insufficient_credits" | "no_payer" | "registry_refused" | null;
+  /** The names under it that point at a computer, on any computer. */
+  pointed?: { domain: string; computer_id: string; computer_name: string | null; status: string }[];
+};
+
+/**
+ * The workspace's bought domains (GET /projects/{id}/domains): `registrar` when buying is open to this
+ * account, `can_buy` when this key may (full access, a person's own key), and `last_contact`, who they
+ * registered their last one to, which only goes back to the window (Bops never keeps it).
+ */
+export type OrgoBoughtList = { enabled?: boolean; registrar?: boolean; can_buy?: boolean; renewals_enabled?: boolean; domains?: OrgoBoughtDomain[]; last_contact?: Record<string, unknown> | null };
+
+/** A record as orgo-web takes it to add or change one (the whole record either way). */
+export type OrgoRecordInput = { type: string; name: string; value: string; priority?: number | string; weight?: number | string; port?: number | string };
+
+/** One part of a path, as it goes in the URL. */
+const seg = (s: string) => encodeURIComponent(s);
+
+/**
+ * How long a buy waits for Orgo's answer: 180 seconds, as orgo-web's registration alone can take 120 after
+ * its lookup, quote and hold (BOPS_DOMAIN_BUY_MS for a test). A buy not answered in time is never sent again.
+ */
+const buyMs = () => {
+  const n = Number(process.env.BOPS_DOMAIN_BUY_MS);
+  return Number.isFinite(n) && n > 0 ? n : 180_000;
+};
+
+/**
+ * orgo-web's domains, with the user's key: the custom domains a computer serves (each on one of its ports),
+ * and the DNS of a domain bought through Orgo, in its workspace. Changes to a zone rewrite all of it at the
+ * registrar, at most 60 an hour per person, and nothing here touches a computer, so none waits for one to
+ * wake. Anything Orgo turns down throws its OrgoError, with all it answered.
+ */
+export const domains = {
+  /** The computer's custom domains, and the workspace's bought domains it can use (`owned_domains`, only when it can take one). */
+  ofComputer: (computerId: string) =>
+    call<{ enabled?: boolean; owned_domains?: { id: string; domain: string }[]; domains?: OrgoCustomDomain[] }>("GET", `/computers/${seg(computerId)}/domains`, undefined, { wait: false }),
+  /**
+   * The Orgo workspace a computer is in, whose bought domains are the ones it can serve (null: Orgo didn't
+   * say). Only the id is kept: the computer's record carries its VNC password.
+   */
+  workspaceOf: async (computerId: string) => {
+    const c = await call<{ workspace_id?: unknown; project_id?: unknown }>("GET", `/computers/${seg(computerId)}`, undefined, { wait: false });
+    const id = c.workspace_id ?? c.project_id;
+    return typeof id === "string" && id ? id : null;
+  },
+  /** What the internet answers for one of them now, beside what it should (30 looks a minute per person). */
+  check: (computerId: string, domainId: string) => call<OrgoDnsCheck>("GET", `/computers/${seg(computerId)}/domains/${seg(domainId)}/dns-check`, undefined, { wait: false }),
+  /** The workspace's bought domains, whether this key may buy one, and who the user last registered one to. */
+  bought: (projectId: string) => call<OrgoBoughtList>("GET", `/projects/${seg(projectId)}/domains`, undefined, { wait: false }),
+  /**
+   * Point a domain at a port of the computer: one typed in full (the user's own, or a name under one of the
+   * workspace's bought domains, which Orgo then writes the records of), or a bought one picked by its id.
+   * Answers it with the records to set, if any. Never made again by itself: it's added once.
+   */
+  connect: (computerId: string, d: { domain: string } | { registered_domain_id: string; subdomain: string }, port: number) =>
+    call<OrgoCustomDomain>("POST", `/computers/${seg(computerId)}/domains`, { ...d, target_port: port }, { wait: false }),
+  /** Ask Orgo to check a domain's DNS now and turn it on once it answers (a 409 with what's missing while it doesn't). */
+  verify: (computerId: string, domainId: string) => call<{ status: string }>("POST", `/computers/${seg(computerId)}/domains/${seg(domainId)}/verify`, {}, { wait: false }),
+  /** Point a domain at another port of its computer (the app it serves moved). */
+  move: (computerId: string, domainId: string, port: number) =>
+    call<OrgoCustomDomain>("PATCH", `/computers/${seg(computerId)}/domains/${seg(domainId)}`, { target_port: port }, { wait: false }),
+  /** Take a domain off the computer (a bought one's records Orgo wrote for it go too; the domain stays the workspace's). */
+  remove: (computerId: string, domainId: string) => call<{ deleted?: boolean }>("DELETE", `/computers/${seg(computerId)}/domains/${seg(domainId)}`, undefined, { wait: false }),
+  /** Names to buy for `q`, a page of extensions at a time, priced in Orgo credits (30 searches a minute per person). */
+  search: (q: string, page: number) =>
+    call<{ results?: OrgoDomainOffer[]; next_page?: number | null; registrar_error?: boolean }>("GET", `/domains/search?q=${seg(q)}&page=${Math.max(0, Math.floor(page))}`, undefined, { wait: false }),
+  /**
+   * Buy a domain for the workspace, charged to the user's Orgo credits: `expected` is the price in cents the
+   * user saw and agreed to, which Orgo checks against a fresh quote (409 PRICE_CHANGED with the new one).
+   * Never sent again by itself (an answer lost is REGISTRATION_UNKNOWN, settled by Orgo).
+   */
+  buy: (projectId: string, domain: string, registrant: Record<string, string>, expected: number) =>
+    call<OrgoBoughtDomain>("POST", `/projects/${seg(projectId)}/domains`, { domain, registrant, expected_price_cents: expected }, { wait: false, timeoutMs: buyMs() }),
+  /** Turn a bought domain's auto-renew on (the caller pays its renewals from their credits from then on) or off. */
+  autoRenew: (projectId: string, domainId: string, on: boolean) =>
+    call<{ domain: OrgoBoughtDomain }>("PATCH", `/projects/${seg(projectId)}/domains/${seg(domainId)}`, { auto_renew: on }, { wait: false }),
+  /** A bought domain's zone: where it's answered and every record in it. */
+  zone: (projectId: string, domainId: string) => call<OrgoZone>("GET", `/projects/${seg(projectId)}/domains/${seg(domainId)}/dns`, undefined, { wait: false }),
+  /** Add a record; answers it and the zone as written. */
+  addRecord: (projectId: string, domainId: string, r: OrgoRecordInput) =>
+    call<{ record: OrgoDnsRecord; records: OrgoDnsRecord[] }>("POST", `/projects/${seg(projectId)}/domains/${seg(domainId)}/dns/records`, r, { wait: false }),
+  /** Change a record (`r` is all of it, as it becomes); answers it and the zone as written. */
+  changeRecord: (projectId: string, domainId: string, recordId: string, r: OrgoRecordInput) =>
+    call<{ record: OrgoDnsRecord; records: OrgoDnsRecord[] }>("PATCH", `/projects/${seg(projectId)}/domains/${seg(domainId)}/dns/records/${seg(recordId)}`, r, { wait: false }),
+  /** Remove a record; answers the zone as written. */
+  removeRecord: (projectId: string, domainId: string, recordId: string) =>
+    call<{ deleted: boolean; records: OrgoDnsRecord[] }>("DELETE", `/projects/${seg(projectId)}/domains/${seg(domainId)}/dns/records/${seg(recordId)}`, undefined, { wait: false }),
+};
 
 /** Screen id for an X display number: 99 is the boot screen, 100-102 are created screens. */
 export const screenId = (display: number) => (display === 99 ? "default" : `screen-${display}`);

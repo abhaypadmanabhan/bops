@@ -231,7 +231,7 @@ test("builds from before: their whole-state upload is taken until a newer build 
 });
 
 /** What 0.0.29 and later send besides (lib/server/app-version.ts appHeaders): which state they may be given. */
-const NEWER = { "x-bops-state-level": "3" };
+const NEWER = { "x-bops-state-level": "4" };
 /** A routine 0.0.28 would start over and over (its nextRun throws on `time` after the task started). */
 const EVERY = { id: "rtn_every", botId: "boppy", title: "Inbox", goal: "Check my inbox", schedule: { kind: "every", minutes: 30 }, enabled: true, nextRunAt: 1 };
 const noticesOf = async (userId: string, headers: Record<string, string> = {}) =>
@@ -250,7 +250,7 @@ test("once a Mac on a newer Bops wrote the user's state, an older Mac is kept ou
   // The newer Mac writes what the older one can't run: the row is its level from then on.
   assert.equal((await putState(id, 1, { owner: { name: "Old" }, routines: [EVERY] }, newer)).status, 200);
   got = (await (await call(id, "/v1/state", newer)).json()) as CloudState;
-  assert.deepEqual([got.version, got.protocol, got.writer], [2, 3, "mac-new"]);
+  assert.deepEqual([got.version, got.protocol, got.writer], [2, 4, "mac-new"]);
 
   // The older Mac gets none of it, nor a 409 with it to merge, and nothing it sends lands.
   const refused = async (res: Response, what: string) => {
@@ -293,7 +293,7 @@ test("once a Mac on a newer Bops wrote the user's state, an older Mac is kept ou
     assert.equal((await putState(id, 2, { owner: { name: "New" }, routines: [EVERY] }, newer)).status, 200);
     await until(() => mac.frames.find((f) => f.t === "state" && f.version === 3), "the newer Mac hearing of its write");
     got = (await (await call(id, "/v1/state", newer)).json()) as CloudState;
-    assert.deepEqual([got.version, got.protocol, got.state.owner], [3, 3, { name: "New" }]);
+    assert.deepEqual([got.version, got.protocol, got.state.owner], [3, 4, { name: "New" }]);
   } finally {
     mac.ws.close();
   }
@@ -394,6 +394,34 @@ test("removed messages are swept after 30 days; live ones never are; the user's 
   assert.equal(await kept(), Number(removed.seq));
   await sweepRemovedMessages();
   assert.equal(await kept(), Number(removed.seq));
+});
+
+test("many removed in one write, one of them written again: every reader hears each, and the sweep takes only the ones still removed after 30 days", async () => {
+  const id = user("many-removed");
+  await postMessages(id, [1, 2, 3, 4, 5].map((i) => msg(i)));
+  const s1 = (await page(id, 0)).seq;
+  // A chat's every message, or several picked: one write.
+  const res = await postMessages(id, [], ["msg_000001", "msg_000002", "msg_000003", "msg_000004"]);
+  assert.equal(res.status, 200);
+  const removed = await page(id, s1);
+  // One UPDATE gives each row its seq in whatever order Postgres walks them, so they're compared by id.
+  assert.deepEqual(removed.messages.map((m) => [m.id, m.json]).sort(), [["msg_000001", null], ["msg_000002", null], ["msg_000003", null], ["msg_000004", null]]);
+  assert.deepEqual((await page(id, 0)).messages.map((m) => m.id), ["msg_000005"], "from the start, they're gone");
+  // Undo (Restore on the Mac): two written again as they were, each with a seq after its removal's.
+  await postMessages(id, [msg(2), msg(3)]);
+  const back = await page(id, removed.seq);
+  assert.deepEqual(back.messages.map((m) => [m.id, m.json?.text]), [["msg_000002", "hello 2"], ["msg_000003", "hello 3"]]);
+  assert.ok(back.messages.every((m) => m.seq > removed.seq));
+  // (Read from the start in the order they were written: each Mac puts them in time order, lib/server/persist-cloud.ts.)
+  assert.deepEqual((await page(id, 0)).messages.map((m) => m.id).sort(), ["msg_000002", "msg_000003", "msg_000005"]);
+  // 30 days on: the rows still removed go for good, the ones written again stay.
+  await query("UPDATE bops.chat_messages SET updated_at = now() - make_interval(days => $2) WHERE user_id = $1", [id, REMOVED_KEEP_DAYS + 1]);
+  assert.ok((await sweepRemovedMessages()) >= 2);
+  const left = await query<{ id: string; live: boolean }>("SELECT id, json IS NOT NULL AS live FROM bops.chat_messages WHERE user_id = $1 ORDER BY id", [id]);
+  assert.deepEqual(left.rows.map((x) => [x.id, x.live]), [["msg_000002", true], ["msg_000003", true], ["msg_000005", true]]);
+  // Restored after the sweep: a new row, as any new message.
+  await postMessages(id, [msg(1)]);
+  assert.deepEqual((await page(id, 0)).messages.map((m) => m.id).sort(), ["msg_000001", "msg_000002", "msg_000003", "msg_000005"]);
 });
 
 test("the migration moves messages out of the states already uploaded, and runs again safely", async () => {

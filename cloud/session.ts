@@ -127,6 +127,14 @@ async function findOrMakePod(userId: string): Promise<string> {
     // AgentMail refuses a second pod with the same client id: look for the first. Anything else is a real failure.
     if (!(e instanceof ProviderError) || e.status < 400 || e.status >= 500) throw e;
   }
+  const found = await findPod(userId);
+  if (found) return found;
+  throw new Error(`AgentMail made no pod for ${clientId} and has none`);
+}
+
+/** The user's pod at AgentMail by its client id `bops-<userId>`, or null when it has none (delete-user.ts looks for one a setup cut short never kept). */
+export async function findPod(userId: string): Promise<string | null> {
+  const clientId = `bops-${userId}`;
   let pageToken = "";
   for (let page = 0; page < 100; page++) {
     const r = await agentmail<{ pods?: Pod[]; next_page_token?: string | null }>(`/v0/pods?limit=100${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ""}`);
@@ -135,7 +143,7 @@ async function findOrMakePod(userId: string): Promise<string> {
     if (!r.next_page_token) break;
     pageToken = r.next_page_token;
   }
-  throw new Error(`AgentMail made no pod for ${clientId} and has none`);
+  return null;
 }
 
 /** Whether bots' addresses can go on BOPS_MAIL_DOMAIN, last checked (at most every 5 minutes). */
@@ -168,6 +176,12 @@ async function makePodKey(podId: string, userId: string): Promise<string> {
   const r = await agentmail<{ api_key?: string }>(`/v0/pods/${encodeURIComponent(podId)}/api-keys`, "POST", { name: `bops-${userId}`, permissions: POD_KEY_PERMISSIONS });
   if (!r.api_key) throw new Error("AgentMail made a pod key but didn't return it");
   return r.api_key;
+}
+
+/** The user's pod key as kept, or null before their first session made one (proxy.ts sends a computer's mail on with it). */
+export async function podKeyOf(userId: string): Promise<string | null> {
+  const r = await query<{ sealed: string | null }>("SELECT agentmail_key_sealed AS sealed FROM bops.cloud_accounts WHERE user_id = $1", [userId]);
+  return keptKey(r.rows[0]?.sealed ?? null, userId);
 }
 
 /** The pod key kept for this user, or null when there's none or it can't be opened (BOPS_CLOUD_SECRET changed): then a new one is made. */
@@ -262,7 +276,11 @@ function executorKey() {
   return key || null;
 }
 
-/** Make whatever the user doesn't have yet. A provider that fails leaves the rest saved, and the call answers 502 so the Mac tries again. */
+/**
+ * Make whatever the user doesn't have yet. A provider that fails leaves the rest saved, and the call answers 502 so the Mac tries again.
+ * A computer's runner (auth.ts CloudUser.computer) never gets the pod key, which reaches every inbox of
+ * the user's and lives on past the computer: its mail goes through /proxy/agentmail, its bots' inboxes only.
+ */
 async function setUp(user: CloudUser): Promise<CloudSession> {
   await ensureUserRow(user.id);
   await welcome(user.id);
@@ -320,7 +338,7 @@ async function setUp(user: CloudUser): Promise<CloudSession> {
     publicUrl,
     agentmail:
       row.agentmail_pod_id && mailKey
-        ? { podId: row.agentmail_pod_id, apiKey: mailKey, domain: await mailDomain(), handle: handles[MAIN_WORKSPACE]?.handle ?? null, handles }
+        ? { podId: row.agentmail_pod_id, apiKey: user.computer ? "" : mailKey, ...(user.computer ? { proxied: true as const } : {}), domain: await mailDomain(), handle: handles[MAIN_WORKSPACE]?.handle ?? null, handles }
         : null,
     agentphone: config.agentphoneKey() && row.agentphone_sub_account ? { subAccountId: row.agentphone_sub_account, hookUrl: publicUrl ? `${publicUrl}/hooks/agentphone` : "" } : null,
     honcho: config.honchoKey() ? { workspacePrefix: honchoPrefix(user.id) } : null,
@@ -345,6 +363,8 @@ export const routes: Route[] = [
     method: "POST",
     path: "/v1/session",
     auth: "user",
+    // A computer's runner too: the services its own tasks use (no mail key: setUp), and the executor key it hands its computer's Codex.
+    computer: true,
     handle: async (req, res, { user }) => {
       sendJson(res, 200, await setUp(user!));
       // The plan, asked of orgo-web with the user's own key, and what it brings set up: after the answer, never holding it up.

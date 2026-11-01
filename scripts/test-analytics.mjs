@@ -503,9 +503,9 @@ delete process.env.BOPS_CLOUD_URL;
 assert.equal(M.telemetryEnvironment(), "production");
 
 // The header that tells Bops Cloud to send nothing for this Mac (beside the version and which state it may be given).
-assert.deepEqual(V.appHeaders(), { "x-bops-version": "0.0.22", "x-bops-state-level": "3" });
+assert.deepEqual(V.appHeaders(), { "x-bops-version": "0.0.22", "x-bops-state-level": "4" });
 process.env.DO_NOT_TRACK = "1";
-assert.deepEqual(V.appHeaders(), { "x-bops-version": "0.0.22", "x-bops-state-level": "3", "x-bops-telemetry": "off" });
+assert.deepEqual(V.appHeaders(), { "x-bops-version": "0.0.22", "x-bops-state-level": "4", "x-bops-telemetry": "off" });
 delete process.env.DO_NOT_TRACK;
 process.env.NODE_ENV = "test";
 assert.equal(V.telemetryHere(), false);
@@ -554,7 +554,7 @@ const [setup] = await until(() => ofEvent("bops_setup_finished", mark).length &&
 assert.deepEqual(setup.properties.skipped, ["relay"]);
 
 // Starting over keeps the switch.
-assert.match(readFileSync(join(root, "lib/server/store.ts"), "utf8"), /const \{ host, account, usage, relay, macs, analyticsOff \} = box\.state;[\s\S]{0,200}migrate\(\{ host, account, usage, relay, macs, analyticsOff,/);
+assert.match(readFileSync(join(root, "lib/server/store.ts"), "utf8"), /const \{ host, account, usage, relay, macs, analyticsOff(?:, \w+)* \} = box\.state;[\s\S]{0,200}migrate\(\{ host, account, usage, relay, macs, analyticsOff,/);
 
 // Signed out: the switch can't be set.
 S.update((s) => (s.account = undefined));

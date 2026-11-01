@@ -87,7 +87,7 @@ export function SignInCard({
               <KeyIcon />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="text-[13.5px] font-semibold leading-[18px]">{busy ? "Signing in…" : `Sign in as ${l.username}`}</span>
-                <span className="text-[11.5px] leading-4 text-white/60">Saved in your vault{l.hasTotp ? " · makes the 2FA code too" : ""}</span>
+                <span className="text-[11.5px] leading-4 text-white/60">Saved in Logins{l.hasTotp ? " · makes the 2FA code too" : ""}</span>
               </span>
             </button>
           ))}
@@ -115,7 +115,7 @@ export function SignInCard({
         {!code && (
           <label className="flex items-center gap-2 text-[12.5px] leading-4 text-[#3A3A38]">
             <input type="checkbox" checked={save} onChange={(e) => setSave(e.target.checked)} className="size-3.5 accent-[#0A0A0A]" />
-            Save to your vault, so {b.name} can sign in next time
+            Save to Logins, so {b.name} can sign in next time
           </label>
         )}
         {error && <span className="text-[12px] leading-4 text-[#B42318]">{error}</span>}
@@ -164,7 +164,8 @@ function CardShell({
     <div className="pointer-events-none absolute inset-0 z-10 flex items-end justify-center bg-gradient-to-t from-black/25 via-black/5 to-transparent p-4">
       <div
         onClick={(e) => e.stopPropagation()}
-        className={`pointer-events-auto flex max-h-full w-full flex-col gap-3 overflow-y-auto rounded-[22px] bg-white/95 p-4 shadow-[0_0_0_1px_#0000000F,0_24px_60px_-18px_#00000059] backdrop-blur ${compact ? "max-w-[360px]" : "max-w-[440px]"}`}
+        // The arrow over the card, not the hand of the clickable screen under it (as WatchSheet): a click on the card itself does nothing.
+        className={`pointer-events-auto flex max-h-full w-full cursor-default flex-col gap-3 overflow-y-auto rounded-[22px] bg-white/95 p-4 shadow-[0_0_0_1px_#0000000F,0_24px_60px_-18px_#00000059] backdrop-blur ${compact ? "max-w-[360px]" : "max-w-[440px]"}`}
       >
         <div className="flex items-center gap-2.5">
           <Mascot botId={b.id} color={b.color} size={30} />

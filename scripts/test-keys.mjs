@@ -83,6 +83,8 @@ const vault = new Map([
   ["MERCURY_API_KEY", "fake_mercury"],
   ["SOME_TEMPLATE_SECRET", "fake_template"],
 ]);
+/** Values in `vault` for the workspace-scoped key by that name only (the GITHUB_TOKEN listed below), never an account one. */
+const scopedOnly = new Set();
 const orgoCalls = [];
 /** Orgo's reveal answers 429 while this is set: its rate limit. */
 let revealLimited = false;
@@ -108,8 +110,12 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/api/secrets" && req.method === "GET")
     return send(200, {
       secrets: [
-        ...[...vault.keys()].map((name) => ({ name, workspace_id: null, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-02T00:00:00Z" })),
+        // (A value kept only for the workspace-scoped key by that name below isn't an account one: scopedOnly.)
+        ...[...vault.keys()].filter((name) => !scopedOnly.has(name)).map((name) => ({ name, workspace_id: null, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-02T00:00:00Z" })),
         { name: "GITHUB_TOKEN", workspace_id: "6f1c1b7e-1111-4222-8333-944455556666", created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z" },
+        // A Cloudflare key for one Orgo workspace and its zone's id for all: no provider Bops' bots can call.
+        { name: "CLOUDFLARE_API_TOKEN", workspace_id: "6f1c1b7e-1111-4222-8333-944455556666", created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-03T00:00:00Z" },
+        { name: "CLOUDFLARE_ZONE_ID", workspace_id: null, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-03T00:00:00Z" },
       ],
     });
   if (url.pathname === "/api/secrets" && req.method === "POST") {
@@ -184,7 +190,12 @@ const S = await import(`${root}/lib/server/store.ts`);
 const { botChatId } = await import(`${root}/lib/types.ts`);
 const Keys = await import(`${root}/lib/server/keys.ts`);
 const Chat = await import(`${root}/lib/server/chat.ts`);
-const { answerApp } = await import(`${root}/lib/server/composio.ts`);
+const P = await import(`${root}/lib/server/permission.ts`);
+/** Wait for something the chat does in the background (a turn going on from a reply). */
+async function until(check, what, ms = 5000) {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 10))) if (check()) return;
+  assert.fail(`timed out waiting for ${what}`);
+}
 const KeysRoute = await import(`${root}/app/api/keys/route.ts`);
 const KeyRoute = await import(pathToFileURL(`${root}/app/api/keys/[name]/route.ts`).href);
 const RevealRoute = await import(`${root}/app/api/keys/reveal/route.ts`);
@@ -238,6 +249,35 @@ await check("the list is read from Orgo once for a short while, and again when a
   assert.equal(orgoCalls.filter((c) => c.path === "/api/secrets").length, n);
   await (await KeysRoute.GET(req("GET", "/api/keys?fresh=1"))).json();
   assert.equal(orgoCalls.filter((c) => c.path === "/api/secrets").length, n + 1);
+});
+
+await check("every name in the vault, with its scope, for Bops' own use (an app's domains in Cloudflare): read once for a short while, never one of the Keys, nor offered to a bot", async () => {
+  const n = orgoCalls.filter((c) => c.path === "/api/secrets").length;
+  const all = await Keys.vaultNames({ fresh: true });
+  assert.deepEqual(
+    all.filter((k) => k.name.startsWith("CLOUDFLARE_")).map((k) => [k.name, k.workspaceId, k.updatedAt]),
+    [
+      ["CLOUDFLARE_API_TOKEN", "6f1c1b7e-1111-4222-8333-944455556666", "2026-10-03T00:00:00Z"],
+      ["CLOUDFLARE_ZONE_ID", null, "2026-10-03T00:00:00Z"],
+    ],
+    "every name, whatever it's for, with the Orgo workspace it's for",
+  );
+  assert.ok(all.some((k) => k.name === "GITHUB_TOKEN" && k.workspaceId) && all.some((k) => k.name === "STRIPE_SECRET_KEY"));
+  assert.ok(all.every((k) => Object.keys(k).sort().join() === "name,updatedAt,workspaceId"), "names only, never a value");
+  await Keys.vaultNames();
+  assert.equal(orgoCalls.filter((c) => c.path === "/api/secrets").length, n + 1, "read once for a short while");
+  assert.ok(!(await Keys.listKeys({ fresh: true })).some((k) => k.name.startsWith("CLOUDFLARE_")), "not one of the Keys");
+  const page = await (await KeysRoute.GET(req("GET", "/api/keys"))).json();
+  assert.ok(!JSON.stringify(page).includes("CLOUDFLARE"), "not on the Keys page, nor among what can be added there");
+  assert.equal(Keys.keyProvider("CLOUDFLARE_API_TOKEN"), undefined, "no provider a bot can call");
+  assert.throws(() => Keys.grantKey("CLOUDFLARE_API_TOKEN", "boppy", true), /No such key/, "nor given to a bot");
+  const was = S.bot("boppy").keys;
+  S.update(() => (S.bot("boppy").keys = ["CLOUDFLARE_API_TOKEN"]));
+  try {
+    assert.deepEqual(await Keys.usableKeys(S.bot("boppy")), [], "a bot that somehow has it can't use it");
+  } finally {
+    S.update(() => (S.bot("boppy").keys = was));
+  }
 });
 
 await check("a save sends the value to Orgo and nowhere else: not the state, a file or a log", async () => {
@@ -487,33 +527,76 @@ await check("an address in a call_api answer is written down: web_fetch may read
   assert.ok(messages().some((m) => m.text === `Read ${page}`));
 });
 
-await check("a POST waits for the user's yes, every time, even on Just do it; then runs and its answer lands in the chat", async () => {
+await check("a POST asks the user, every time, even on Just do it: the chat turn pauses at it (OpenAI holds the rest), and Allow once carries the same turn on from there with the call's result; Deny with what to do instead tells the bot", async () => {
   S.update(() => (S.bot("boppy").autoApprove = true));
   const n = brokerCalls().length;
-  const t = await turnWith("refund ch_1", [toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_1", "metadata": {"why": "late"}}' })], "Asked you about the refund.");
-  assert.match(t.out(), /^This needs Alex's approval first: POST \/v1\/refunds in Stripe\. Bops is showing them the details\./);
+  answers.push(calling(toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_1", "metadata": {"why": "late"}}' })), reply("Refunded ch_1."));
+  const a0 = asked.length;
+  await Chat.handleMessage(chatId, "refund ch_1");
+  assert.equal(asked.length, a0 + 1, "one model call: the turn paused at the call, its output not sent");
   assert.equal(brokerCalls().length, n, "nothing sent yet");
   const apr = S.getState().appApprovals.at(-1);
-  assert.equal(apr.title, "POST /v1/refunds in Stripe");
-  assert.match(apr.detail, /"charge": "ch_1"/);
+  assert.deepEqual([apr.action, apr.resources, apr.kind, apr.api], ["Call Stripe", ["POST /v1/refunds"], "api", { key: "STRIPE_SECRET_KEY", label: "Stripe", method: "POST", path: "/v1/refunds" }]);
+  assert.match(apr.preview, /"charge": "ch_1"/);
   assert.equal(apr.chatId, chatId);
-  answerApp(apr.id, true);
-  for (let i = 0; i < 100 && brokerCalls().length === n; i++) await new Promise((r) => setTimeout(r, 10));
-  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([apr.resume.engine, apr.resume.responseId, apr.resume.call.name], ["chat", `resp_${a0 + 1}`, "call_api"], "what goes on from it: the response it paused in, and the call");
+  assert.ok(!messages().slice(-3).some((m) => /approval first/.test(m.text)), "no word from the bot meanwhile: the card says it");
+  assert.equal(P.replyToAsk(apr.id, "once"), undefined);
+  await until(() => asked.length === a0 + 2 && messages().at(-1)?.text === "Refunded ch_1.", "the turn to go on from the reply");
+  const resumed = asked[a0 + 1];
+  assert.equal(resumed.previous_response_id, apr.resume.responseId, "on the response it paused in");
+  assert.match(hear(outputOf(resumed)), /^What Stripe answered/, "the call's output: what was done");
   const c = brokerCalls().at(-1);
   assert.deepEqual(c.body, { name: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: { charge: "ch_1", metadata: { why: "late" } } });
+  assert.equal(brokerCalls().length, n + 1, "done once");
   const done = messages().findLast((m) => m.appResult);
   assert.equal(done.text, "Boppy: Called Stripe POST /v1/refunds");
   assert.equal(done.appResult.ok, true);
   assert.match(done.appResult.output, /^What Stripe answered/);
-  // A no: nothing sent.
+  assert.ok(!S.getState().appApprovals.some((a) => a.id === apr.id), "taken out by the Bops that asked, as it read the reply");
+  // A no, with what to do instead: the bot is told, as that call's output, and nothing is sent.
   const k = brokerCalls().length;
-  await turnWith("refund ch_2", [toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "DELETE", path: "/v1/customers/cus_2", query: null, body: null })]);
-  answerApp(S.getState().appApprovals.at(-1).id, false);
-  await new Promise((r) => setTimeout(r, 30));
+  answers.push(calling(toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "DELETE", path: "/v1/customers/cus_2", query: null, body: null })), reply("Ok, archived instead."));
+  const a1 = asked.length;
+  await Chat.handleMessage(chatId, "delete cus_2");
+  assert.equal(P.replyToAsk(S.getState().appApprovals.at(-1).id, "reject", "Archive the customer instead"), undefined);
+  await until(() => asked.length === a1 + 2 && messages().some((m) => m.text === "Ok, archived instead."), "the turn to go on from the no");
+  assert.equal(outputOf(asked[a1 + 1]), "Declined: Archive the customer instead");
+  assert.equal(messages().at(-1).text, "Boppy didn't do it: Archive the customer instead");
   assert.equal(brokerCalls().length, k);
-  assert.equal(messages().at(-1).text, "Boppy didn't call it: you said no");
   S.update(() => (S.bot("boppy").autoApprove = undefined));
+});
+
+await check("Always allow on a call with one of the user's keys saves a rule for that bot and that service, whatever it calls: the same call and any other to it go without asking after", async () => {
+  const n = brokerCalls().length;
+  answers.push(calling(toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/invoices/in_1/send", query: null, body: null })), reply("Sent."));
+  const a0 = asked.length;
+  await Chat.handleMessage(chatId, "send invoice in_1");
+  const apr = S.getState().appApprovals.at(-1);
+  assert.equal(P.replyToAsk(apr.id, "always"), undefined);
+  await until(() => asked.length === a0 + 2 && brokerCalls().length === n + 1, "the turn to go on");
+  assert.deepEqual(S.bot("boppy").permissions, [{ action: "Call Stripe", resource: "*", effect: "allow" }]);
+  const again = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/invoices/in_1/send", query: null, body: null }, { chatId }, { chat: true });
+  assert.equal(again.did, "Called Stripe POST /v1/invoices/in_1/send", "no ask for it again");
+  const other = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_9"}' }, { chatId }, { chat: true });
+  assert.equal(other.did, "Called Stripe POST /v1/refunds", "nor for another call to Stripe");
+  S.update(() => delete S.bot("boppy").permissions);
+});
+
+await check("a GET that went out and failed leaves a red note no one approved: the bot's next turn never reads it as Alex's approval, while an approved call's does", async () => {
+  brokerAnswers.set("/v1/customers/cus_gone", { status: 404, contentType: "application/json", body: { error: { message: "No such customer" } }, truncated: false, headers: {} });
+  await turnWith("who's cus_gone?", [toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "GET", path: "/v1/customers/cus_gone", query: null, body: null })], "Couldn't find them.");
+  const note = messages().findLast((m) => m.appResult);
+  assert.equal(note.text, "Boppy couldn't call it: Stripe answered 404");
+  assert.deepEqual([note.appResult.action, note.appResult.ok, note.appResult.unasked], ["Stripe GET /v1/customers/cus_gone", false, true]);
+  // The next turn: what the bot is told of that note, and of the refund Alex approved before.
+  answers.push(reply("Ok."));
+  const n = asked.length;
+  await Chat.handleMessage(chatId, "and now?");
+  const told = JSON.stringify(asked[n].input);
+  assert.match(told, /\[Bops: Stripe GET \/v1\/customers\/cus_gone was called without asking Alex\. It failed; /);
+  assert.ok(!told.includes("Alex approved Stripe GET"), told);
+  assert.match(told, /\[Bops: Alex approved Stripe POST \/v1\/refunds\. It ran; /);
 });
 
 await check("a read-only service takes only GET, and a task's call_api reads only", async () => {
@@ -558,6 +641,78 @@ await check("a turn someone outside Bops started (a text, an email) has no call_
   assert.ok(!toolNames(asked[n]).includes("call_api"));
 });
 
+await check("a member's turn (someone Alex gave Write on the bot) has call_api for the keys its bot has: a GET runs, and anything else asks Alex every time, named as theirs, even with an Always allow saved", async () => {
+  const dee = { userId: "user_dee", email: "dee@example.com", name: "Dee" };
+  const had = S.getState().workspaces;
+  S.update((st) => (st.workspaces = [{ id: "ws_main", name: "Main", createdAt: 0, memberAccess: { "dee@example.com": { others: "none", bots: { boppy: "write" }, at: 1 } } }]));
+  S.update(() => (S.bot("boppy").permissions = [{ action: "Call Stripe", resource: "*", effect: "allow" }]));
+  try {
+    await Keys.listKeys({ fresh: true });
+    answers.push(reply("Ok."));
+    const n = asked.length;
+    await Chat.handleMessage(chatId, "what's our Stripe balance?", undefined, undefined, undefined, undefined, undefined, undefined, undefined, dee);
+    assert.ok(toolNames(asked[n]).includes("call_api"), "the keys Boppy has");
+    const k = brokerCalls().length;
+    const get = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "GET", path: "/v1/balance", query: null, body: null }, { chatId, member: "Dee" }, { chat: true });
+    assert.equal(get.did, "Called Stripe GET /v1/balance", "a GET runs");
+    const post = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_7"}' }, { chatId, member: "Dee" }, { chat: true }).then(() => null, (e) => e);
+    assert.ok(post instanceof P.NeedsOk, "a POST asks, the rule notwithstanding");
+    assert.deepEqual([post.ask.kind, post.ask.askedFor], ["api", "Dee"], "Alex's to answer (member-access.ts ownerOnlyAsk), named as Dee's");
+    assert.equal(brokerCalls().length, k + 1, "only the GET went out");
+    const mine = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_7"}' }, { chatId }, { chat: true });
+    assert.equal(mine.did, "Called Stripe POST /v1/refunds", "Alex's own goes by the rule");
+  } finally {
+    S.update((st) => {
+      st.workspaces = had;
+      delete S.bot("boppy").permissions;
+    });
+  }
+});
+
+await check("Used in: a key of one workspace switched on in another is listed there, may be given to its bots, and is called through its own workspace's project; off, the bots there lose it", async () => {
+  const PROJ_A = "6f1c1b7e-1111-4222-8333-944455556666";
+  const had = { workspaces: S.getState().workspaces, workspace: S.getState().workspace };
+  S.update((st) => {
+    st.workspaces = [
+      { id: "ws_main", name: "Main", createdAt: 0, orgoProjectId: PROJ_A },
+      { id: "ws_fern", name: "Fernway", createdAt: 1, orgoProjectId: "7a2d3c4e-1111-4222-8333-944455556666" },
+    ];
+    st.bots.push({ id: "juno", name: "Juno", role: "Sales", color: "#2EC4B6", isMain: false, computerStatus: "none", workspaceId: "ws_fern" });
+  });
+  vault.set("GITHUB_TOKEN", "ghp_fake_token");
+  scopedOnly.add("GITHUB_TOKEN");
+  try {
+    const all = await Keys.listKeys({ fresh: true });
+    assert.ok(!Keys.keysOf(all, "ws_fern").some((k) => k.name === "GITHUB_TOKEN"), "Main's GitHub key isn't Fernway's");
+    const LoginsRoute = await import(`${root}/app/api/logins/route.ts`);
+    const flip = (on, window = true) => LoginsRoute.PATCH(req("PATCH", "/api/logins", { kind: "key", id: `${PROJ_A}:GITHUB_TOKEN`, workspaceId: "ws_fern", on }, window));
+    assert.equal((await flip(true, false)).status, 403, "only from the Bops window");
+    assert.equal((await flip(true)).status, 200);
+    assert.ok(Keys.keysOf(all, "ws_fern").some((k) => k.name === "GITHUB_TOKEN"), "switched on in Fernway");
+    Keys.grantKey("GITHUB_TOKEN", "juno", true);
+    assert.deepEqual((await Keys.usableKeys(S.bot("juno"))).map((k) => k.name), ["GITHUB_TOKEN"]);
+    S.update((st) => (st.workspace = "ws_fern"));
+    const listed = (await (await KeysRoute.GET(req("GET", "/api/keys"))).json()).keys.find((k) => k.name === "GITHUB_TOKEN");
+    assert.deepEqual([listed.scope, listed.from, listed.bots], ["workspace", "ws_main", ["juno"]], "listed in Fernway as Main's");
+    const r = await Keys.callApi("juno", { key: "GITHUB_TOKEN", method: "GET", path: "/user/repos", query: null, body: null }, { chatId: botChatId("juno") }, { chat: true });
+    assert.equal(r.did, "Called GitHub GET /user/repos");
+    assert.equal(brokerCalls().at(-1).body.workspace_id, PROJ_A, "through Main's project, where the key is");
+    assert.equal((await flip(false)).status, 200);
+    assert.equal(S.getState().workspaces[1].loginsOn, undefined);
+    assert.equal(S.bot("juno").keys, undefined, "off: Juno can't use it any more");
+    assert.equal((await LoginsRoute.PATCH(req("PATCH", "/api/logins", { kind: "key", id: `${PROJ_A}:GITHUB_TOKEN`, workspaceId: "ws_main", on: false }))).status, 409, "never off in its own workspace");
+  } finally {
+    vault.delete("GITHUB_TOKEN");
+    scopedOnly.delete("GITHUB_TOKEN");
+    S.update((st) => {
+      st.workspaces = had.workspaces;
+      st.workspace = had.workspace;
+      st.bots = st.bots.filter((b) => b.id !== "juno");
+    });
+    await Keys.listKeys({ fresh: true });
+  }
+});
+
 await check("a query in the path goes in the query, and a GET's body is dropped", async () => {
   const r = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "GET", path: "/v1/customers?email=a%40b.example&limit=3", query: '{"limit": 5}', body: "{}" }, { sessionId: "ses_x" });
   assert.equal(r.did, "Called Stripe GET /v1/customers");
@@ -571,11 +726,14 @@ await check("Slack's GETs ask first unless they only read, and a task can't make
   await Keys.listKeys({ fresh: true });
   const n = brokerCalls().length;
   const asks = S.getState().appApprovals?.length ?? 0;
-  const t = await turnWith("post in general", [toolCall("call_api", { key: "SLACK_BOT_TOKEN", method: "GET", path: "/chat.postMessage", query: '{"channel": "C1", "text": "hi"}', body: null })]);
-  assert.match(t.out(), /^This needs Alex's approval first: GET \/chat\.postMessage in Slack\./);
+  answers.push(calling(toolCall("call_api", { key: "SLACK_BOT_TOKEN", method: "GET", path: "/chat.postMessage", query: '{"channel": "C1", "text": "hi"}', body: null })), reply("Ok."));
+  const a0 = asked.length;
+  await Chat.handleMessage(chatId, "post in general");
   assert.equal(brokerCalls().length, n, "nothing sent yet");
-  assert.equal(S.getState().appApprovals.length, asks + 1);
-  answerApp(S.getState().appApprovals.at(-1).id, false);
+  assert.equal(S.getState().appApprovals.length, asks + 1, "it asks");
+  assert.deepEqual(S.getState().appApprovals.at(-1).resources, ["GET /chat.postMessage"]);
+  P.replyToAsk(S.getState().appApprovals.at(-1).id, "reject");
+  await until(() => asked.length === a0 + 2, "the turn to go on from the no");
   const task = await Keys.callApi("boppy", { key: "SLACK_BOT_TOKEN", method: "GET", path: "/chat.delete", query: '{"channel": "C1", "ts": "1"}', body: null }, { sessionId: "ses_x" });
   assert.match(task.text, /^Only GET here, and only reads\./);
   assert.equal(brokerCalls().length, n);
@@ -595,7 +753,7 @@ await check("bank, payroll and compliance keys stay out of a task, and paths tha
   assert.equal(r.text, "Mercury is for the chat only, not a task.");
   for (const p of ["MERCURY_API_KEY", "RIPPLING_API_KEY", "VANTA_API_TOKEN"]) assert.equal(Keys.keyProvider(p).chatOnly, true);
   const n = brokerCalls().length;
-  const k = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/ephemeral_keys", query: null, body: '{"customer": "cus_1"}' }, { chatId }, () => {});
+  const k = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/ephemeral_keys", query: null, body: '{"customer": "cus_1"}' }, { chatId }, { chat: true });
   assert.match(hear(k.text), /^Bops doesn't call \/v1\/ephemeral_keys in Stripe: it makes a new key/);
   for (const [name, path] of [["OPENAI_ADMIN_KEY", "/v1/organization/admin_api_keys"], ["OPENAI_ADMIN_KEY", "/v1/organization/projects/p1/service_accounts"], ["RESEND_API_KEY", "/api-keys"]]) assert.ok(Keys.keyProvider(name).denied.test(path), `${name} ${path}`);
   assert.equal(brokerCalls().length, n);
@@ -604,7 +762,7 @@ await check("bank, payroll and compliance keys stay out of a task, and paths tha
 await check("a write too long to show in full is refused, not cut on the card", async () => {
   const asks = S.getState().appApprovals?.length ?? 0;
   const body = JSON.stringify({ variables: { pad: "x".repeat(5000) }, charge: "ch_1" });
-  const r = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body }, { chatId }, () => assert.fail("asked"));
+  const r = await Keys.callApi("boppy", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body }, { chatId }, { chat: true });
   assert.match(hear(r.text), /^That's too long to show Alex for a yes \(\d+ characters, at most 4000\)\./);
   assert.equal(S.getState().appApprovals?.length ?? 0, asks);
 });
@@ -612,10 +770,11 @@ await check("a write too long to show in full is refused, not cut on the card", 
 await check("a service's 4xx is a failure: an approved write and a GET both leave a red note", async () => {
   brokerAnswers.set("/v1/refunds", { status: 400, contentType: "application/json", body: { error: { message: "Charge ch_1 has already been refunded." } }, truncated: false, headers: {} });
   const n = brokerCalls().length;
-  await turnWith("refund ch_1 again", [toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_1"}' })]);
-  answerApp(S.getState().appApprovals.at(-1).id, true);
-  for (let i = 0; i < 100 && brokerCalls().length === n; i++) await new Promise((r) => setTimeout(r, 10));
-  await new Promise((r) => setTimeout(r, 20));
+  answers.push(calling(toolCall("call_api", { key: "STRIPE_SECRET_KEY", method: "POST", path: "/v1/refunds", query: null, body: '{"charge": "ch_1"}' })), reply("It was already refunded."));
+  const a0 = asked.length;
+  await Chat.handleMessage(chatId, "refund ch_1 again");
+  P.replyToAsk(S.getState().appApprovals.at(-1).id, "once");
+  await until(() => brokerCalls().length === n + 1 && asked.length === a0 + 2, "the approved write");
   const done = messages().findLast((m) => m.appResult);
   assert.equal(done.text, "Boppy couldn't call it: Stripe answered 400");
   assert.equal(done.appResult.ok, false);

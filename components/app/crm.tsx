@@ -638,7 +638,7 @@ function Pick({ label, value, onChange, children }: { label: string; value: stri
           aria-label={label}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="h-8 max-w-[220px] cursor-pointer appearance-none truncate rounded-full bg-white pl-3 pr-7 text-[13px] text-ink shadow-[0_0_0_1px_#E6E6E3] outline-none hover:bg-[#FCFCFB] focus-visible:shadow-[0_0_0_1.5px_#0A0A0A]"
+          className="h-8 max-w-[220px] appearance-none truncate rounded-full bg-white pl-3 pr-7 text-[13px] text-ink shadow-[0_0_0_1px_#E6E6E3] outline-none hover:bg-[#FCFCFB] focus-visible:shadow-[0_0_0_1.5px_#0A0A0A]"
         >
           {children}
         </select>
@@ -1404,8 +1404,11 @@ function Frame({ mode, drop, children }: { mode: "panel" | "focus"; drop: Drop; 
 
 /* ---------------- The note in the chat ---------------- */
 
-/** "Boppy added 3 rows to Leads", with Open and Undo (lib/server/crm.ts undoNote). */
-export function CrmNote({ m }: { m: Message }) {
+/**
+ * "Boppy added 3 rows to Leads", with Open and Undo (lib/server/crm.ts undoNote). Neither when `readOnly`: a
+ * workspace shared with the user, whose CRM is its owner's (the file opened would be the viewer's own of that name).
+ */
+export function CrmNote({ m, readOnly = false }: { m: Message; readOnly?: boolean }) {
   const c = m.crm!;
   const open = useContext(OpenCrm);
   const [busy, setBusy] = useState(false);
@@ -1430,7 +1433,7 @@ export function CrmNote({ m }: { m: Message }) {
           <CrmFileIcon size={13} />
         </span>
         <span className={`min-w-0 flex-1 ${c.undone ? "text-[#9A9A98] line-through" : "text-[#3A3A3A]"}`}>{m.text}</span>
-        {open && !(c.undone && c.created) && (
+        {open && !readOnly && !(c.undone && c.created) && (
           <button onClick={() => open(c.ws, c.file)} className={button}>
             Open
           </button>
@@ -1438,9 +1441,11 @@ export function CrmNote({ m }: { m: Message }) {
         {c.undone ? (
           <span className="shrink-0 px-2 py-0.5 font-medium text-[#9A9A98]">Undone</span>
         ) : (
-          <button disabled={busy} onClick={() => void undo()} className={button}>
-            Undo
-          </button>
+          !readOnly && (
+            <button disabled={busy} onClick={() => void undo()} className={button}>
+              Undo
+            </button>
+          )
         )}
       </div>
       {error && <span className="pl-[21px] pt-1 text-[#B42318]">{error}</span>}
