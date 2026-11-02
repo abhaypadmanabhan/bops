@@ -116,6 +116,8 @@ type Shared = {
   user: string;
   ws: string;
   list: IssueList | null;
+  /** Bops couldn't be reached for them while there's no list to show (null: none failed): the page says so, with Try again. */
+  failed: string | null;
   users: Set<() => void>;
   asked: number;
   shown: number;
@@ -132,7 +134,7 @@ const url = (ws: string, id?: string) => `/api/orbit/issues${id ? `/${encodeURIC
 
 function sharedOf(user: string, ws: string) {
   let s = shared.get(keyOf(user, ws));
-  if (!s) shared.set(keyOf(user, ws), (s = { user, ws, list: null, users: new Set(), asked: 0, shown: 0, reading: 0, readAt: 0 }));
+  if (!s) shared.set(keyOf(user, ws), (s = { user, ws, list: null, failed: null, users: new Set(), asked: 0, shown: 0, reading: 0, readAt: 0 }));
   return s;
 }
 
@@ -142,6 +144,7 @@ function show(s: Shared, list: IssueList, asked = ++s.asked) {
   // History comes with an issue's own answer: a list without it keeps what's here.
   const had = new Map((s.list?.issues ?? []).map((i) => [i.id, i]));
   s.list = { ...list, issues: list.issues.map((i) => (i.history || !had.get(i.id)?.history ? i : { ...i, history: had.get(i.id)!.history })) };
+  s.failed = null;
   s.readAt = Date.now();
   for (const changed of s.users) changed();
   plan(s);
@@ -167,7 +170,12 @@ function read(s: Shared) {
       // No issues to be had (not set up yet, memory off): an empty list, so the section says so.
       else if (!s.list && asked >= s.shown) show(s, { issues: [], tags: [] }, asked);
     })
-    .catch(() => {})
+    // Bops itself out of reach, with nothing to show yet: said, with Try again (never an endless spinner).
+    .catch(() => {
+      if (s.list || asked < s.shown) return;
+      s.failed = "Couldn't reach Bops.";
+      for (const changed of s.users) changed();
+    })
     .finally(() => {
       s.reading--;
     });
@@ -290,7 +298,16 @@ async function remove(user: string, ws: string, id: string): Promise<string | nu
 }
 
 /** The store without React, for scripts/test-orbit-ui.mjs. */
-export const issueStore = { watch, update, remove, loadHistory, list: (user: string, ws: string) => shared.get(keyOf(user, ws))?.list ?? null };
+/** Try again: the failure goes (the page waits on the read again) and the issues are read now. */
+function retry(user: string, ws: string) {
+  const s = shared.get(keyOf(user, ws));
+  if (!s) return;
+  s.failed = null;
+  for (const changed of s.users) changed();
+  read(s);
+}
+
+export const issueStore = { watch, update, remove, loadHistory, retry, list: (user: string, ws: string) => shared.get(keyOf(user, ws))?.list ?? null, failed: (user: string, ws: string) => shared.get(keyOf(user, ws))?.failed ?? null };
 
 export type IssueActs = { update: (id: string, patch: IssuePatch) => Promise<string | null>; remove: (id: string) => Promise<string | null>; history: (id: string) => void };
 
@@ -301,10 +318,12 @@ export type IssueActs = { update: (id: string, patch: IssuePatch) => Promise<str
 export function useIssues(ws: string, user = "", on = true) {
   const subscribe = useCallback((changed: () => void) => (on ? watch(user, ws, changed) : () => {}), [user, ws, on]);
   const list = useSyncExternalStore(subscribe, () => (on ? (shared.get(keyOf(user, ws))?.list ?? null) : null), () => null);
+  const failed = useSyncExternalStore(subscribe, () => (on ? (shared.get(keyOf(user, ws))?.failed ?? null) : null), () => null);
+  const again = useCallback(() => retry(user, ws), [user, ws]);
   const updateOne = useCallback((id: string, patch: IssuePatch) => update(user, ws, id, patch), [user, ws]);
   const removeOne = useCallback((id: string) => remove(user, ws, id), [user, ws]);
   const historyOf = useCallback((id: string) => void loadHistory(user, ws, id), [user, ws]);
-  return { list, acts: { update: updateOne, remove: removeOne, history: historyOf } as IssueActs };
+  return { list, failed, retry: again, acts: { update: updateOne, remove: removeOne, history: historyOf } as IssueActs };
 }
 
 /* ---------------- Marks ---------------- */
@@ -400,7 +419,7 @@ export function IssuesPage({
   onClose: () => void;
 }) {
   useNow(60_000);
-  const { list, acts } = useIssues(ws, user);
+  const { list, failed, retry, acts } = useIssues(ws, user);
   const [openId, setOpenId] = useState<string | null>(focus ?? null);
   const [asked, setAsked] = useState({ focus, focusAt });
   if (asked.focus !== focus || asked.focusAt !== focusAt) {
@@ -474,7 +493,14 @@ export function IssuesPage({
           </div>
         )}
         <div key={`${status}.${tag}.${priority}`} className="motion-fade-in flex flex-col">
-          {!list ? (
+          {!list && failed ? (
+            <div role="alert" className="flex flex-col items-center gap-3 py-12 text-center">
+              <span className="text-[13.5px] leading-5 text-[#6B6B6B]">{failed}</span>
+              <button onClick={retry} className="rounded-full bg-[#F2F2F0] px-3 py-1.5 text-[12.5px] font-medium leading-4 text-[#3A3A38] hover:bg-[#EAEAE7]">
+                Try again
+              </button>
+            </div>
+          ) : !list ? (
             <div className="flex justify-center py-12">
               <Spinner size={16} color="#9A9A98" />
             </div>
