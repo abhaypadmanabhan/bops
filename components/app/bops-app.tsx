@@ -128,6 +128,15 @@ function Bops({ state }: { state: AppState | null }) {
   }, [threadId]);
   const [composing, setComposing] = useState(false);
   const [panelOpen, setPanelOpen] = useState(true);
+  // A workspace shared with the user opens with the side panel closed: its bots' computers are the owner's, and nothing
+  // here shows their screens (shared-core.ts viewState carries none), so the chat gets the window. Their own workspaces
+  // open it, as always. Said once per switch: opening or closing it by hand after that stays as it is.
+  const sharedWs = state?.shared?.wsId ?? null;
+  const [panelFor, setPanelFor] = useState<string | null>(null);
+  if (state && sharedWs !== panelFor) {
+    setPanelFor(sharedWs);
+    setPanelOpen(!sharedWs);
+  }
   // The sidebar on the left, or its rail of icons once you collapse it (sidebar-rail.tsx; this Mac
   // remembers; ⌘\ or the toggle).
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || localStorage.getItem(SIDEBAR_KEY) !== "0");
