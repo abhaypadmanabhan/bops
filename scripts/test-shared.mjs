@@ -879,12 +879,13 @@ await check("a bot's localhost link in a shared workspace is text saying it open
   const { LocalOnly } = await import(pathToFileURL(`${root}/components/app/panel-tabs.tsx`).href);
   const state = everythingState();
   state.sessions = [...state.sessions, { ...state.sessions[0], id: "local", title: "Run Four Corners Local", status: "running", createdAt: 8 }];
-  state.messages = [...state.messages, { id: "m-local", chatId: "bot:boppy", role: "bot", botId: "boppy", text: "It runs. [Open the preview](http://localhost:3101/) or go to http://127.0.0.1:3101/start, or http://localhost:3000?view=home#cover now. Not http://localhost.example.com/", at: 10, sessionIds: ["local"] }];
+  state.messages = [...state.messages, { id: "m-local", chatId: "bot:boppy", role: "bot", botId: "boppy", text: "It runs. [Open the preview](http://localhost:3101/) or go to http://127.0.0.1:3101/start, or http://localhost:3000?view=home#cover now. Not http://localhost.example.com/ but http://localhost:3000. And http://localhost.", at: 10, sessionIds: ["local"] }];
   const shared = renderToStaticMarkup(h(LocalOnly.Provider, { value: state.bots }, h(ChatView, chatProps(state, "bot:boppy"))));
   assert.ok(!/href="http:\/\/(localhost|127\.0\.0\.1)/.test(shared), "no link that would open the viewer's own localhost");
   assert.match(text(shared), /Open the preview \(opens only on Dana's Boppy's computer\) or go to http:\/\/127\.0\.0\.1:3101\/start \(opens only on Dana's Boppy's computer\) ?, or/, "a comma after it stays the sentence's");
   assert.match(text(shared), /http:\/\/localhost:3000\?view=home#cover \(opens only on Dana's Boppy's computer\) now\./, "a query and a fragment stay with the address");
   assert.match(text(shared), /Not http:\/\/localhost\.example\.com\//);
+  assert.match(text(shared), /but http:\/\/localhost:3000 \(opens only on Dana's Boppy's computer\) ?\. And http:\/\/localhost \(opens only on Dana's Boppy's computer\) ?\./, "a full stop after the port or the host ends the address");
   assert.ok(!/localhost\.example\.com\/? ?\(opens only/.test(text(shared)) && !/localhost \(opens only[^)]*\)\.example/.test(text(shared)), "another host is left alone");
   assert.match(text(shared), /Run Four Corners on its computer/, "the thread's chip");
   assert.ok(!/Run Four Corners Local/.test(text(shared)));

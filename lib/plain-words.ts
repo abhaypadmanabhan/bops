@@ -23,7 +23,7 @@ export const localOnlyLine = (botName?: string) => `opens only on ${botName ? `$
 export function plainTitle(title: string): string {
   return title
     .replace(/\s+(?:local|locally|on localhost(?::\d+)?)$/i, " on its computer")
-    .replace(/(?:https?:\/\/)?\b(?:localhost|127\.0\.0\.1)(?::\d+)?(?![\w.-])(?:[/?#][^\s]*)?/gi, "its computer");
+    .replace(/(?:https?:\/\/)?\b(?:localhost|127\.0\.0\.1)(?::\d+)?(?![\w:-]|\.[\w-])(?:[/?#](?:[^\s]*[^\s.,;:!?])?)?/gi, "its computer");
 }
 
 /** A step's detail, as a person would say it. */

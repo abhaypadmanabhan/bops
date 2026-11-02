@@ -208,7 +208,7 @@ function Inline({ text }: { text: string }) {
     if (browser || !openLink) window.open(url, "_blank");
     else openLink(url, label);
   };
-  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`|https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?![\w.-])(?:[/?#](?:[^\s)]*[^\s).,;:!?])?)?)/g);
+  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`|https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?![\w:-]|\.[\w-])(?:[/?#](?:[^\s)]*[^\s).,;:!?])?)?)/g);
   return (
     <>
       {parts.map((p, i) => {

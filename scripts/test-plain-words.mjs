@@ -40,6 +40,7 @@ check("a thread's title says where an app's copy runs, its computer, not Local o
   assert.equal(plainTitle("Local news digest"), "Local news digest", "Local only where it ends the title");
   assert.equal(plainTitle("Call the local printer"), "Call the local printer");
   assert.equal(plainTitle("Check localhost:3000?view=home"), "Check its computer");
+  assert.equal(plainTitle("Open localhost:3000. Then check the cover"), "Open its computer. Then check the cover", "a full stop after the port ends it");
   assert.equal(plainTitle("Read http://localhost.example.com/docs"), "Read http://localhost.example.com/docs", "another host stays");
 });
 
