@@ -413,9 +413,9 @@ export const orbitStore = {
   preview: previewDelete,
 };
 
-/** Forget for a page: what can be undone, what went wrong, and the calls. */
-export function useForget(ws: string, user = "") {
-  const subscribe = useCallback((changed: () => void) => watch(user, ws, changed), [user, ws]);
+/** Forget for a page: what can be undone, what went wrong, and the calls. `on` false: nothing is read (useMemoryCategories). */
+export function useForget(ws: string, user = "", on = true) {
+  const subscribe = useCallback((changed: () => void) => (on ? watch(user, ws, changed) : () => {}), [user, ws, on]);
   const state = useSyncExternalStore(subscribe, () => shared.get(keyOf(user, ws))?.forgetting ?? NOT_FORGETTING, () => NOT_FORGETTING);
   const forgetItems = useCallback((items: Pick<MemoryItem, "id" | "title">[]) => forget(user, ws, items), [user, ws]);
   const undo = useCallback(() => undoForget(user, ws), [user, ws]);
@@ -483,8 +483,8 @@ const watchSeen = (changed: () => void) => {
  * Whether Knowledge has something new for the footer's dot, from the same copy the page reads (and as
  * often). The first copy in a workspace Knowledge was never open in is marked seen as it comes.
  */
-export function useKnowledgeNews(ws: string, user = "") {
-  const { snap } = useMemoryCategories(ws, user);
+export function useKnowledgeNews(ws: string, user = "", on = true) {
+  const { snap } = useMemoryCategories(ws, user, on);
   const seen = useSyncExternalStore(watchSeen, () => seenOf(user, ws), () => undefined);
   const items = snap?.on ? snap.items : null;
   useEffect(() => {
@@ -749,7 +749,7 @@ function KnowledgeView({
   const owners = state?.shared ? `Knowledge in ${state.shared.name} is kept on the owner's Bops, so it doesn't show here. To find something out, ask a bot in its chat.` : undefined;
   const { snap, act, failed, retry } = useMemoryCategories(ws, user, !owners);
   const { list } = useIssues(ws, user, !owners);
-  const forgetting = useForget(ws, user);
+  const forgetting = useForget(ws, user, !owners);
   // Pinned to the sidebar's Favorites from the chips (with the app's state only: it keeps them).
   const favorites = useFavorites(state, ws);
   const openIssues = list ? list.issues.filter(isOpen).length : undefined;

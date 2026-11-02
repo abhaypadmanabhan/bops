@@ -561,6 +561,34 @@ answer = (url, method, body) => {
 const opened = (id, user = "u9") => h(IssuesPage, { user, ws: "w9", focus: id, tags: WS_TAGS, nav: null, onClose: noop });
 const patches = () => calls.filter((c) => c.method === "PATCH").map((c) => c.body);
 
+await test("in a workspace shared with the user, Knowledge and the footer's Knowledge button read nothing, mounted", async () => {
+  const { MemoryView } = await import(pathToFileURL(`${root}/components/app/memory-categories.tsx`).href);
+  const { KnowledgeButton } = await import(pathToFileURL(`${root}/components/app/sidebar.tsx`).href);
+  const state = {
+    account: { user: { id: "u7" } },
+    workspace: "shared_p7",
+    workspaces: [{ id: "shared_p7", name: "brandlord", createdAt: 1 }],
+    bots: [{ id: "boppy", name: "Boppy", isMain: true, workspaceId: "shared_p7" }],
+    chats: [],
+    sessions: [],
+    shared: { projectId: "p7", name: "brandlord", owner: "tiger@orgo.ai", role: "admin", wsId: "shared_p7", levels: { boppy: "write" } },
+  };
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    disconnect() {}
+  };
+  const page = await mount(h(MemoryView, { state, user: "u7", ws: "shared_p7", category: "all", onCategory: noop, onClose: noop }));
+  const button = await mount(h(KnowledgeButton, { state, expanded: false, pressed: false, onOpen: noop }));
+  await act(async () => {
+    win.dispatchEvent?.(new win.Event("focus"));
+    await settle();
+  });
+  assert.match(page.box.textContent, /kept on the owner's Bops/);
+  assert.deepEqual(calls.filter((c) => /^\/api\/(memory|orbit)/.test(c.url)).map((c) => c.url), [], "no memory or issues read");
+  await page.done();
+  await button.done();
+});
+
 await test("an issue's + Tag opens a Bops picker over the page, not a datalist: every workspace tag, the ones on it checked in place", async () => {
   tagged = [issue("issue-9", { ws: "w9", tags: ["Customer", "Outage"] })];
   const m = await mount(opened("issue-9", "u9a"));
