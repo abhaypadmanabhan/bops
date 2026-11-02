@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { favoritesOf, storedFavorites, toggledFavorite, type FavoriteKind } from "@/lib/favorites";
+import { favoritesOf, storedFavorites, toggledFavorite, type FavoritePin } from "@/lib/favorites";
 import type { AppState } from "@/lib/types";
 import { currentWorkspace, post } from "./ui";
 
@@ -48,8 +48,8 @@ export function useFavorites(state: AppState | undefined, ws = state ? currentWo
   return {
     stored,
     shown,
-    pinned: (id: FavoriteKind) => shown.includes(id),
-    toggle: (id: FavoriteKind) => save(toggledFavorite(stored, id)),
+    pinned: (id: FavoritePin) => shown.includes(id),
+    toggle: (id: FavoritePin) => save(toggledFavorite(stored, id)),
     save,
     can,
   };
@@ -68,6 +68,10 @@ export function PinIcon({ on = false, size = 11 }: { on?: boolean; size?: number
 }
 
 export type MenuItem = { label: string; onPick: () => void; disabled?: boolean };
+
+/** A row menu's Favorites item for a chat or a thread: Add to Favorites, or Remove from Favorites once pinned. None where nothing's saved (`can` false: a shared workspace). */
+export const pinItems = (favorites: Favorites, pin: FavoritePin): MenuItem[] =>
+  favorites.can ? [{ label: favorites.pinned(pin) ? "Remove from Favorites" : "Add to Favorites", onPick: () => favorites.toggle(pin) }] : [];
 
 /**
  * A small menu where the right-click was (`x`, `y`; kept inside the window), as the bots' menu opens:

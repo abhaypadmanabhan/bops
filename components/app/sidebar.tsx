@@ -16,6 +16,8 @@ import { BotMenu, type BotMenuActions } from "./bot-menu";
 import { RestartAsk, RestartIcon, useCanRestart } from "./restart";
 import { useSetupNeedsYou, useSetupWaiting } from "./setup";
 import { DeleteX, forgetShown, rememberShown, undash, usePop } from "./side-group";
+import { pinItems, useFavorites } from "./favorites";
+import { threadPin } from "@/lib/favorites";
 import { attentionOf, FavoritesSection, needsByBot, threadOrder, threadsByBot, threadsOf, ThreadRow, WithThreads } from "./sidebar-sections";
 import { useIssues } from "./orbit-issues";
 import { UpdateNotice } from "./update-notice";
@@ -171,6 +173,9 @@ export function Sidebar({
   const { list: issues } = useIssues(ws, user, categoriesOpen(state) && !state.shared);
   useEffect(() => rememberShown((issues?.issues ?? []).map((i) => `issue:${i.id}`)), [issues]);
   const needs = needsByBot(state, issues?.issues ?? null, state.shared ? [] : setup);
+  // A thread's right-click menu: pin it to Favorites, or take it off (none in a shared workspace: useFavorites `can`).
+  const favorites = useFavorites(state, ws);
+  const threadMenu = (s: Session) => pinItems(favorites, threadPin(s.id));
   // The threads Waiting for your OK: a request of theirs is unanswered (lib/types.ts waitsForOk), wherever they run.
   const okWaits = new Set(waitingAsks(state).flatMap((a) => (a.threadId ? [a.threadId] : [])));
   const attention = attentionOf(state, needs);
@@ -207,6 +212,7 @@ export function Sidebar({
         readOnly={!!state.shared}
         row={row}
         onOpenThread={onOpenThread}
+        threadMenu={threadMenu}
         onOpenIssue={(i) => onOpenMemory({ category: "issues", focus: i.id })}
         onOpenWatch={onOpenWatch}
         onSetup={onSetup}
@@ -284,7 +290,7 @@ export function Sidebar({
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         {/* What needs you and what you pinned: over everything, and gone while you search. */}
-        {!q && <FavoritesSection state={state} attention={attention.count} onAttention={openAttention} onOpenMemory={onOpenMemory} />}
+        {!q && <FavoritesSection state={state} attention={attention.count} onAttention={openAttention} onOpenMemory={onOpenMemory} onOpenChat={onOpenChat} onOpenThread={onOpenThread} />}
         {/*
           The main bot's row first (it runs the team), then the rest by latest activity; the bots that work on one
           computer together under its name (bot-groups.tsx), right under the main bot when it's on that computer.
@@ -325,7 +331,7 @@ export function Sidebar({
           <div className="flex flex-col pt-4">
             <div className="px-2.5 pb-1.5 text-[13px] font-medium leading-4 text-[#9A9A98]">Threads</div>
             {found.map((s) => (
-              <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={!!state.shared} okWait={okWaits.has(s.id)} />
+              <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={!!state.shared} okWait={okWaits.has(s.id)} menu={threadMenu(s)} />
             ))}
           </div>
         )}
