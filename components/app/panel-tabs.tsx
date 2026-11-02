@@ -198,11 +198,12 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
   const host = b ? computerOf(state, b) : undefined;
   const label =
     t.kind === "computer"
-      ? // A shared workspace's computers are its owner's, whichever bot's name the owner's Bops gives them.
+      ? // A shared workspace's computers are its owner's: the tab is named for the bot whose chat is open (never for
+        // another bot it shares a computer with), or the owner's Mac for one that runs there.
         state.shared
         ? b?.runsOn === "mac"
           ? "Owner's Mac"
-          : "Owner's computer"
+          : `${b?.name ?? "Bot"}'s computer`
         : host && host.id !== b?.id
         ? `${host.name}'s computer`
         : `${b?.name ?? "Bot"}'s computer`

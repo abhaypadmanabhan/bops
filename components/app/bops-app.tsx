@@ -128,6 +128,15 @@ function Bops({ state }: { state: AppState | null }) {
   }, [threadId]);
   const [composing, setComposing] = useState(false);
   const [panelOpen, setPanelOpen] = useState(true);
+  // A workspace shared with the user opens with the side panel closed: its bots' computers are the owner's, and nothing
+  // here shows their screens (shared-core.ts viewState carries none), so the chat gets the window. Their own workspaces
+  // open it, as always. Said once per switch: opening or closing it by hand after that stays as it is.
+  const sharedWs = state?.shared?.wsId ?? null;
+  const [panelFor, setPanelFor] = useState<string | null>(null);
+  if (state && sharedWs !== panelFor) {
+    setPanelFor(sharedWs);
+    setPanelOpen(!sharedWs);
+  }
   // The sidebar on the left, or its rail of icons once you collapse it (sidebar-rail.tsx; this Mac
   // remembers; ⌘\ or the toggle).
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || localStorage.getItem(SIDEBAR_KEY) !== "0");
@@ -464,8 +473,9 @@ function Bops({ state }: { state: AppState | null }) {
         (tab.kind === "bot" && tab.id !== PROFILE_TAB));
     if (lead && !browsing && !focus) {
       // Its screen comes up with it, even with the side panel hidden, and the panel follows the action
-      // again (several at once show side by side), even if you'd picked a screen before.
-      setPanelOpen(true);
+      // again (several at once show side by side), even if you'd picked a screen before. Not in a workspace
+      // shared with the user: no screen of the owner's shows here, so the panel stays as they left it.
+      if (!state.shared) setPanelOpen(true);
       if (lead.runsOn !== "mac") setPinned((p) => ({ ...p, [lead.botId]: false }));
       // In a workspace shared with the user, a lead on the owner's Mac is never the viewer's own Mac tab (opensMacTab).
       if (opensMacTab(state, lead)) {

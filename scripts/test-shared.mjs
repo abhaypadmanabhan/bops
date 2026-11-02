@@ -1339,12 +1339,14 @@ await check("the viewer's own Mac is never a shared workspace's: no Your Mac tab
   // (As the window has it: the follower and an opened thread go by opensMacTab.)
   const app = readFileSync(`${root}/components/app/bops-app.tsx`, "utf8");
   assert.match(app, /if \(opensMacTab\(state, lead\)\) \{/);
+  // Nor does the owner's work open the side panel (it shows none of their screens): it stays as the viewer left it.
+  assert.match(app, /if \(lead && !browsing && !focus\) \{\n(?: *\/\/[^\n]*\n)* *if \(!state\.shared\) setPanelOpen\(true\);/);
   assert.match(app, /if \(opensMacTab\(state, s\)\) \{/);
   assert.equal((app.match(/kind: "mac" \}\]\)/g) ?? []).length, 2, "nowhere else opens it on its own");
   // The tab, were it shown: no Working dot for the owner's work.
   const bar = renderToStaticMarkup(h(TabBar, { state: st, tabs: [mac], active: "chat", chatBotId: "boppy", onPick: noop, onClose: noop, onNew: noop }));
   assert.ok(!/title="Working"/.test(bar), bar);
-  assert.match(bar, />Owner&#x27;s computer</, "the chat's computer tab is the owner's, not named for another bot");
+  assert.match(bar, />Dana&#x27;s Boppy&#x27;s computer</, "the chat's computer tab is named for the open bot, not another one it shares a computer with");
   // The user's own: as always.
   const mine = { ...own(), host: "mac", sessions: [{ ...c.state.sessions[0], botId: "boppy" }] };
   assert.equal(tabsShown([mac], mine, opts(mine)).length, 1);
@@ -1421,11 +1423,12 @@ await check("nor anywhere else: no full width Your Mac carried over or kept capt
   assert.match(text(renderToStaticMarkup(h(BotComputersList, { state: onMac, keys: null, padded: false }))), /Dana's Boppy Works on the owner's Mac/);
   assert.match(text(renderToStaticMarkup(h(BotComputersList, { state: { ...own(), host: "mac" }, keys: null, padded: false }))), /Your bots' computers Sam's Boppy Uses this Mac/, "the user's own: as always");
   assert.match(readFileSync(`${root}/components/app/bops-app.tsx`, "utf8"), /<BotComputers state=\{state\} padded=\{!selfHosted\} askKeys=\{!selfHosted && !state\.shared\} \/>/, "nor asked about the owner's computers' keys");
-  // The tabs: a helper's computer tab is its main bot's, as its Details say.
+  // The tabs: a helper works on its main bot's computer (as its Details say), and its tab here is named for the helper,
+  // as its panel says "Dana's Helper works on the owner's computer" (never the main bot's name for it).
   const helper = st.bots.find((b) => b.id === "helper");
   assert.equal(computerOf(st, helper).id, "boppy");
   const bar = text(renderToStaticMarkup(h(TabBar, { state: st, tabs: [{ id: "t1", kind: "computer", botId: "helper" }], active: "t1", chatBotId: "boppy", onPick: noop, onClose: noop, onNew: noop })));
-  assert.ok(!bar.includes("Dana's Helper's computer"), bar);
+  assert.match(bar, /Dana's Helper's computer/, bar);
   assert.equal(computerOf({ ...own(), host: "mac", bots: st.bots }, helper).id, "helper", "the user's own on their Mac: every bot its own browsers");
 });
 
