@@ -875,6 +875,24 @@ const chatProps = (state, chatId) => ({ state, chat: state.chats.find((c) => c.i
 const READ_ONLY_LINES = ["You can watch this bot. Ask the owner for Write to chat with it.", "You can chat here once the owner gives you Write on every bot in it."];
 const yous = (html, ...allowed) => (html.match(/[^<>"]*\b(you|your|yours|yourself)\b[^<>"]*/gi) ?? []).filter((x) => ![...allowed, ...READ_ONLY_LINES].some((a) => x.includes(a)));
 
+await check("a bot's localhost link in a shared workspace is text saying it opens only on the bot's computer, and a thread's title is in plain words; in the user's own the link opens", async () => {
+  const { LocalOnly } = await import(pathToFileURL(`${root}/components/app/panel-tabs.tsx`).href);
+  const state = everythingState();
+  state.sessions = [...state.sessions, { ...state.sessions[0], id: "local", title: "Run Four Corners Local", status: "running", createdAt: 8 }];
+  state.messages = [...state.messages, { id: "m-local", chatId: "bot:boppy", role: "bot", botId: "boppy", text: "It runs. [Open the preview](http://localhost:3101/) or go to http://127.0.0.1:3101/start", at: 10, sessionIds: ["local"] }];
+  const shared = renderToStaticMarkup(h(LocalOnly.Provider, { value: state.bots }, h(ChatView, chatProps(state, "bot:boppy"))));
+  assert.ok(!/href="http:\/\/(localhost|127\.0\.0\.1)/.test(shared), "no link that would open the viewer's own localhost");
+  assert.match(text(shared), /Open the preview \(opens only on Dana's Boppy's computer\) or go to http:\/\/127\.0\.0\.1:3101\/start \(opens only on Dana's Boppy's computer\)/);
+  assert.match(text(shared), /Run Four Corners on its computer/, "the thread's chip");
+  assert.ok(!/Run Four Corners Local/.test(text(shared)));
+  // The user's own (no LocalOnly): the link is a link, as always (it opens the bot's preview beside the chat).
+  const mine = renderToStaticMarkup(h(ChatView, chatProps(state, "bot:boppy")));
+  assert.match(mine, /href="http:\/\/localhost:3101\/"/);
+  assert.ok(!/opens only on/.test(mine));
+  // The window gives it in a shared workspace only.
+  assert.match(readFileSync(`${root}/components/app/bops-app.tsx`, "utf8"), /<LocalOnly\.Provider value=\{state\.shared \? state\.bots : null\}>/);
+});
+
 await check("nothing in a shared workspace's open chat says the owner's as the viewer's or asks them to chat: its header, an empty chat, a text's or email's note, a thread's chip, sheet and asks", () => {
   const state = everythingState();
   const chat = renderToStaticMarkup(h(ChatView, chatProps(state, "bot:boppy")));

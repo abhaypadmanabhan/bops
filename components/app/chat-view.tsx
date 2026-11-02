@@ -8,7 +8,7 @@ import { trackEvent } from "@/lib/analytics";
 import { BLOCKER_ASK, BRAINS_ON, COMPACTED, live, ownerSent, pairChatId, routineSent, threadCompactBlocked, threadCompacts, threadRunner, waitingAsks, WAITING_FOR_OK, waitsForOk, withRemoteTyping, workBot, workspaceOf, TAPBACK_EMOJI, TAPBACKS, type AppApproval, type AppState, type Blocker, type Bot, type Chat, type MadeApp, type Message, type Session, type Tapback, type ThreadReply } from "@/lib/types";
 import { Tapback as TapbackBalloon, TapbackGlyph, tapbackVars } from "@/components/message-ui/tapback";
 import { Mascot } from "./mascot";
-import { OpenBotLocal, OpenLink, OpenPreview } from "./panel-tabs";
+import { LocalOnly, OpenBotLocal, OpenLink, OpenPreview } from "./panel-tabs";
 import { appCoders } from "@/lib/hosted-apps";
 import { appsShown } from "@/lib/apps-access";
 import { appsOwnShown } from "@/lib/apps-access";
@@ -38,7 +38,7 @@ import { threadAgentWords, threadKind } from "./bot-ai";
 import { AgentChipPick, boxAgents, pickLine, useBotKeys } from "./new-thread";
 import { AskInPlace, ChatAvatar, chatName, clockTime, memberAnswers, needsYou, post, ReadOnlyLine, StatusIcon, teamOf, useNow } from "./ui";
 import { ReplyDrafts } from "./reply-drafts";
-import { dropCitations, plainStep } from "@/lib/plain-words";
+import { dropCitations, isLocalLink, localOnlyLine, plainStep, plainTitle } from "@/lib/plain-words";
 import { SkillProposals } from "./skill-proposals";
 
 /** Light markdown for bot text: **bold** and [links](url). */
@@ -190,6 +190,13 @@ function Inline({ text }: { text: string }) {
   const openLink = useContext(OpenLink);
   const openLocal = useContext(OpenBotLocal);
   const botId = useContext(LinkedBy);
+  // A workspace shared with the user: a bot's localhost link is on its computer, which the viewer can't reach. Said as text.
+  const localOnly = useContext(LocalOnly);
+  const onlyThere = (words: string) => (
+    <span data-local-link>
+      {words} <span className="text-[#6B6B6B]">({localOnlyLine(localOnly?.find((b) => b.id === botId)?.name)})</span>
+    </span>
+  );
   // A file that couldn't be opened says why right after the text, in place (never a browser alert), until the next try.
   const [failed, setFailed] = useState<string | null>(null);
   const openFile = async (href: string, label: string, browser: boolean) => {
@@ -201,7 +208,7 @@ function Inline({ text }: { text: string }) {
     if (browser || !openLink) window.open(url, "_blank");
     else openLink(url, label);
   };
-  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`)/g);
+  const parts = text.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\)|`[^`\n]+`|https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/[^\s)]*)?)/g);
   return (
     <>
       {parts.map((p, i) => {
@@ -210,7 +217,9 @@ function Inline({ text }: { text: string }) {
         if (code) return <code key={i} className="rounded-[5px] bg-black/[0.06] px-1 py-px font-mono text-[12.5px] [overflow-wrap:anywhere]">{code[1]}</code>;
         const bold = /^\*\*([^*]+)\*\*$/.exec(p);
         if (bold) return <strong key={i} className="font-semibold">{bold[1]}</strong>;
+        if (localOnly && isLocalLink(p)) return <Fragment key={i}>{onlyThere(p)}</Fragment>;
         const link = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(p);
+        if (link && localOnly && isLocalLink(link[2])) return <Fragment key={i}>{onlyThere(link[1])}</Fragment>;
         if (link) {
           const page = link[2].startsWith("/api/pages/");
           return (
@@ -226,7 +235,7 @@ function Inline({ text }: { text: string }) {
                   return;
                 }
                 // A bot's localhost link is its app's Local: its preview beside the chat (else its screen), never this Mac's own localhost.
-                if (botId && openLocal && /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/|$)/i.test(link[2])) {
+                if (botId && openLocal && isLocalLink(link[2])) {
                   e.preventDefault();
                   openLocal(botId, link[2]);
                   return;
@@ -2277,7 +2286,7 @@ function SessionChip({ session: s, state, onClick }: { session: Session; state: 
           <span className="sr-only">{agentWords.label}: </span>
         </span>
       )}
-      <span className={`truncate text-[14px] leading-[18px] ${live(s) || waiting ? "text-ink" : "text-[#6B6B6B]"}`}>{s.title}</span>
+      <span className={`truncate text-[14px] leading-[18px] ${live(s) || waiting ? "text-ink" : "text-[#6B6B6B]"}`}>{plainTitle(s.title)}</span>
       {/* Where it runs: the user's Mac (the owner's, in a shared workspace) or the cloud (deciding: nothing yet). */}
       {s.runsOn === "mac" ? (
         <span title={`On ${state.shared ? "the owner's" : "your"} Mac`} className="flex shrink-0 items-center gap-1 rounded-full bg-[#F2F2F0] px-1.5 py-px text-[11px] leading-[14px] text-[#3A3A38]">
@@ -2438,7 +2447,7 @@ export function ThreadSheet({
           <Mascot botId={b.id} color={b.color} size={32} />
           <div className="flex min-w-0 flex-1 flex-col gap-px">
             <div className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate text-[15px] font-semibold leading-[18px]">{s.title}</span>
+              <span className="truncate text-[15px] font-semibold leading-[18px]">{plainTitle(s.title)}</span>
               {shownAgent ? <AgentChip agent={shownAgent} label={agentWords.label} title={[agentWords.label, agentWords.pays, badge?.kind === "agent" ? badge.title : ""].filter(Boolean).join(" · ")} /> : badge && <BrainBadge kind={badge.kind} title={badge.title} />}
             </div>
             {agentPays && <span className="text-[12px] leading-4 text-[#6B6B6B]">{agentPays}</span>}
@@ -3016,7 +3025,7 @@ function NeedsYouCard({
         <span className="min-w-0 flex-1 truncate">{title}</span>
         {pinned && onOpen && (
           <button onClick={onOpen} className="max-w-[45%] shrink-0 truncate text-[12px] font-medium leading-4 text-[#6B6B6B] hover:text-ink" title="Open the thread">
-            {s.title}
+            {plainTitle(s.title)}
             {display !== undefined ? ` · screen ${screenNo(display)}` : ""}
           </button>
         )}

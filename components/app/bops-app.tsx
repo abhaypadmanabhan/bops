@@ -23,7 +23,7 @@ import { tagsOf } from "@/lib/routine-catalog";
 import { CrmView, OpenCrm } from "./crm";
 import { BoppyLoading, BotMoodsFrom, CallTalking, Mascot, talkingStore } from "./mascot";
 import { MemoryView, type MemoryOpen } from "./memory-categories";
-import { CHAT_TAB, electron, forgetTab, hostOf, isReading, memoryAgain, NewTab, OpenBotLocal, OpenLink, OpenPreview, TabBar, WebTab, type PanelTab, type PreviewOpened } from "./panel-tabs";
+import { CHAT_TAB, electron, forgetTab, hostOf, isReading, LocalOnly, memoryAgain, NewTab, OpenBotLocal, OpenLink, OpenPreview, TabBar, WebTab, type PanelTab, type PreviewOpened } from "./panel-tabs";
 import { PreviewTab } from "./preview-tab";
 import { MadeAppsHome, MadeAppTab, OpenMadeApp } from "./made-apps";
 import { appsStamp, HostedAppTab, OpenAppTask, OpenHostedApp, OpenSettings } from "./hosted-apps";
@@ -985,6 +985,7 @@ function Bops({ state }: { state: AppState | null }) {
     <OpenBotComputer.Provider value={openBotComputer}>
     <OpenPreview.Provider value={openPreview}>
     <OpenBotLocal.Provider value={openBotLocal}>
+    <LocalOnly.Provider value={state.shared ? state.bots : null}>
     <ComposerBridgeProvider value={composerBridge}>
       <TooltipLayer />
       {/* A shared workspace's chats aren't the user's own: nothing of them is said as what they're looking at. */}
@@ -1401,6 +1402,7 @@ function Bops({ state }: { state: AppState | null }) {
         {!(tab?.kind === "mac" && panelOpen) && !state.shared && <MacPreviews state={state} onOpen={openMac} />}
       </div>
     </ComposerBridgeProvider>
+    </LocalOnly.Provider>
     </OpenBotLocal.Provider>
     </OpenPreview.Provider>
     </OpenBotComputer.Provider>
