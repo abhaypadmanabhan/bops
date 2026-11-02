@@ -589,6 +589,24 @@ await test("in a workspace shared with the user, Knowledge and the footer's Know
   await button.done();
 });
 
+await test("Issues: Bops out of reach says so with Try again, never an endless spinner; Try again reads again, mounted", async () => {
+  const before = answer;
+  let down = true;
+  answer = (url, method, body) =>
+    url.startsWith("/api/orbit/issues?ws=w6") ? (down ? Promise.reject(new Error("offline")) : { status: 200, body: { issues: [issue("issue-9", { ws: "w6", title: "Printer jam" })], tags: [] } }) : before(url, method, body);
+  const page = await mount(h(IssuesPage, { user: "u1", ws: "w6", onClose: noop }));
+  assert.match(page.box.textContent, /Couldn't reach Bops\./);
+  assert.ok(!page.box.innerHTML.includes("animate-spin"), "no spinner");
+  const again = [...page.box.querySelectorAll("button")].find((b) => b.textContent === "Try again");
+  assert.ok(again, "Try again");
+  down = false;
+  await click(again);
+  assert.match(page.box.textContent, /Printer jam/);
+  assert.equal(issueStore.failed("u1", "w6"), null);
+  await page.done();
+  answer = before;
+});
+
 await test("an issue's + Tag opens a Bops picker over the page, not a datalist: every workspace tag, the ones on it checked in place", async () => {
   tagged = [issue("issue-9", { ws: "w9", tags: ["Customer", "Outage"] })];
   const m = await mount(opened("issue-9", "u9a"));
