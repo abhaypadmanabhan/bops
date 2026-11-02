@@ -473,8 +473,9 @@ function Bops({ state }: { state: AppState | null }) {
         (tab.kind === "bot" && tab.id !== PROFILE_TAB));
     if (lead && !browsing && !focus) {
       // Its screen comes up with it, even with the side panel hidden, and the panel follows the action
-      // again (several at once show side by side), even if you'd picked a screen before.
-      setPanelOpen(true);
+      // again (several at once show side by side), even if you'd picked a screen before. Not in a workspace
+      // shared with the user: no screen of the owner's shows here, so the panel stays as they left it.
+      if (!state.shared) setPanelOpen(true);
       if (lead.runsOn !== "mac") setPinned((p) => ({ ...p, [lead.botId]: false }));
       // In a workspace shared with the user, a lead on the owner's Mac is never the viewer's own Mac tab (opensMacTab).
       if (opensMacTab(state, lead)) {

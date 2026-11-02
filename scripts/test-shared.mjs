@@ -1337,6 +1337,8 @@ await check("the viewer's own Mac is never a shared workspace's: no Your Mac tab
   // (As the window has it: the follower and an opened thread go by opensMacTab.)
   const app = readFileSync(`${root}/components/app/bops-app.tsx`, "utf8");
   assert.match(app, /if \(opensMacTab\(state, lead\)\) \{/);
+  // Nor does the owner's work open the side panel (it shows none of their screens): it stays as the viewer left it.
+  assert.match(app, /if \(lead && !browsing && !focus\) \{\n(?: *\/\/[^\n]*\n)* *if \(!state\.shared\) setPanelOpen\(true\);/);
   assert.match(app, /if \(opensMacTab\(state, s\)\) \{/);
   assert.equal((app.match(/kind: "mac" \}\]\)/g) ?? []).length, 2, "nowhere else opens it on its own");
   // The tab, were it shown: no Working dot for the owner's work.
