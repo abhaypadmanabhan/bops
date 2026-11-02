@@ -16,7 +16,7 @@ import { BotMenu, type BotMenuActions } from "./bot-menu";
 import { RestartAsk, RestartIcon, useCanRestart } from "./restart";
 import { useSetupNeedsYou, useSetupWaiting } from "./setup";
 import { DeleteX, forgetShown, rememberShown, undash, usePop } from "./side-group";
-import { pinItems, useFavorites } from "./favorites";
+import { menuPoint, pinItems, SideMenu, useFavorites } from "./favorites";
 import { threadPin } from "@/lib/favorites";
 import { attentionOf, FavoritesSection, needsByBot, threadOrder, threadsByBot, threadsOf, ThreadRow, WithThreads } from "./sidebar-sections";
 import { useIssues } from "./orbit-issues";
@@ -174,8 +174,16 @@ export function Sidebar({
   useEffect(() => rememberShown((issues?.issues ?? []).map((i) => `issue:${i.id}`)), [issues]);
   const needs = needsByBot(state, issues?.issues ?? null, state.shared ? [] : setup);
   // A thread's right-click menu: pin it to Favorites, or take it off (none in a shared workspace: useFavorites `can`).
+  // Drawn here, over everything, as the bots' menu is: inside a thread list's fold it would be clipped.
   const favorites = useFavorites(state, ws);
-  const threadMenu = (s: Session) => pinItems(favorites, threadPin(s.id));
+  const [pinMenu, setPinMenu] = useState<{ s: Session; x: number; y: number } | null>(null);
+  const threadMenu = (s: Session) =>
+    favorites.can
+      ? (e: React.MouseEvent) => {
+          e.preventDefault();
+          setPinMenu({ s, ...menuPoint(e) });
+        }
+      : undefined;
   // The threads Waiting for your OK: a request of theirs is unanswered (lib/types.ts waitsForOk), wherever they run.
   const okWaits = new Set(waitingAsks(state).flatMap((a) => (a.threadId ? [a.threadId] : [])));
   const attention = attentionOf(state, needs);
@@ -331,7 +339,7 @@ export function Sidebar({
           <div className="flex flex-col pt-4">
             <div className="px-2.5 pb-1.5 text-[13px] font-medium leading-4 text-[#9A9A98]">Threads</div>
             {found.map((s) => (
-              <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={!!state.shared} okWait={okWaits.has(s.id)} menu={threadMenu(s)} />
+              <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={!!state.shared} okWait={okWaits.has(s.id)} onMenu={threadMenu(s)} />
             ))}
           </div>
         )}
@@ -363,6 +371,7 @@ export function Sidebar({
         onApps={onApps}
       />
       {menu && menuBot && menuActions && <BotMenu state={state} bot={menuBot} x={menu.x} y={menu.y} onClose={() => setMenu(null)} actions={menuActions} />}
+      {pinMenu && <SideMenu x={pinMenu.x} y={pinMenu.y} label={pinMenu.s.title} items={pinItems(favorites, threadPin(pinMenu.s.id))} onClose={() => setPinMenu(null)} />}
     </aside>
   );
 }

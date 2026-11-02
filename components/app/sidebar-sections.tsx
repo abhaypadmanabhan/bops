@@ -96,22 +96,16 @@ export function railMark(threads: Session[], needs: BotNeeds | undefined, shared
  * `readOnly`: a shared workspace's thread, the owner's to delete (and what it asks, theirs to answer). `okWait`: a
  * request of its for the user's OK is unanswered (lib/types.ts waitsForOk): it waits on them, not working.
  */
-export function ThreadRow({ session: s, onClick, readOnly, okWait, menu: items = [] }: { session: Session; onClick: () => void; readOnly?: boolean; okWait?: boolean; /** Its right-click menu (Add to Favorites); none: no menu. */ menu?: MenuItem[] }) {
+export function ThreadRow({ session: s, onClick, readOnly, okWait, onMenu }: { session: Session; onClick: () => void; readOnly?: boolean; okWait?: boolean; /** Its right-click menu (Add to Favorites), drawn by the sidebar over everything; none: no menu. */ onMenu?: (e: React.MouseEvent) => void }) {
   // New since the sidebar opened: rises in, once.
   const row = useRise(() => arrived(s.id));
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   // Its mark (as StatusIcon draws it) pops when it changes in place, as working turns to needs you.
   const mark = okWait ? "you" : live(s) && !(s.askWhere && needsYou(s)) ? "working" : needsYou(s) ? "you" : s.status;
   const pop = usePop(mark);
   return (
-    <>
     <button
       onClick={onClick}
-      onContextMenu={(e) => {
-        if (!items.length) return;
-        e.preventDefault();
-        setMenu(menuPoint(e));
-      }}
+      onContextMenu={onMenu}
       onAnimationEnd={row.done}
       data-thread={s.id}
       className={`group/thread flex h-[34px] shrink-0 items-center gap-2 rounded-[10px] px-2.5 text-left outline-none hover:bg-black/[0.03] focus-visible:shadow-[inset_0_0_0_1.5px_#0A0A0A] ${row.rise ? "motion-rise-in" : ""}`}
@@ -126,8 +120,6 @@ export function ThreadRow({ session: s, onClick, readOnly, okWait, menu: items =
         <DeleteX label={`Delete ${s.title}`} onDelete={() => void post(`/api/sessions/${s.id}`, {}, "DELETE")} className="group-hover/thread:opacity-100 group-focus-visible/thread:opacity-100" />
       )}
     </button>
-    {menu && <SideMenu x={menu.x} y={menu.y} label={s.title} items={items} onClose={() => setMenu(null)} />}
-    </>
   );
 }
 
@@ -358,7 +350,7 @@ export function WithThreads({
   row: (space: ReactNode) => ReactNode;
   onOpenThread: (s: Session) => void;
   /** A thread row's right-click menu (pinning it to Favorites). */
-  threadMenu?: (s: Session) => MenuItem[];
+  threadMenu?: (s: Session) => ((e: React.MouseEvent) => void) | undefined;
 } & NeedActs) {
   const [open, setOpen] = useRemembered(THREADS, user, ws, botId, false);
   useEffect(() => {
@@ -403,7 +395,7 @@ export function WithThreads({
         <Fold open={open} lazy>
           <div key={botId} className="mb-1 ml-[52px] mr-0.5 flex flex-col border-l border-[#E6E6E3] pl-1.5">
             {cards.length > 0 && <Capped className="gap-1.5 pb-1.5 pt-0.5" rows={cards} />}
-            {threads.length > 0 && <Capped rows={threads.map((s) => <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={readOnly} okWait={okWaits?.has(s.id)} menu={threadMenu?.(s)} />)} />}
+            {threads.length > 0 && <Capped rows={threads.map((s) => <ThreadRow key={s.id} session={s} onClick={() => onOpenThread(s)} readOnly={readOnly} okWait={okWaits?.has(s.id)} onMenu={threadMenu?.(s)} />)} />}
           </div>
         </Fold>
       )}
@@ -562,7 +554,7 @@ export function FavoritesSection({
       return { label: favoriteLabel(id), icon: <KindIcon id={id} />, meta, open: () => onOpenMemory({ category: id }) };
     }
     const chat = state.chats.find((c) => c.id === pinnedChat(id));
-    const thread = state.sessions.find((x) => x.id === pinnedThread(id) && !x.dismissed);
+    const thread = state.sessions.find((x) => x.id === pinnedThread(id));
     const bot = state.bots.find((b) => b.id === (thread?.botId ?? chat?.botIds[0]));
     const face = <span className="flex size-[18px] items-center justify-center">{bot && <Mascot botId={bot.id} color={bot.color} size={18} />}</span>;
     if (chat) return { label: chatName(chat, state.bots), icon: face, meta: null, open: () => onOpenChat(chat.id) };

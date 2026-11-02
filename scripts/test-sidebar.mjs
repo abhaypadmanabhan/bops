@@ -320,10 +320,12 @@ await test("Favorites: nothing until the user pins something (no section), then 
 await test("Favorites: a pinned chat and a pinned thread show with their bot's face and open them; one deleted since is skipped; a chat shows without Knowledge too", () => {
   const opened = [];
   const t1 = session("t1", "nova", { title: "Check the field guide PDF" });
-  const state = world({ sessions: [t1], workspaces: [{ id: "ws_main", name: "Main", createdAt: 1, favorites: ["chat:chat_pip", "thread:t1", "chat:gone", "thread:gone", "people"] }] });
+  // Dismissed: it stops asking, and stays in the sidebar, so its pin stays too.
+  const t2 = session("t2", "pip", { title: "Kept thread", dismissed: true });
+  const state = world({ sessions: [t1, t2], workspaces: [{ id: "ws_main", name: "Main", createdAt: 1, favorites: ["chat:chat_pip", "thread:t1", "chat:gone", "thread:gone", "thread:t2", "people"] }] });
   const html = render(state, { onOpenChat: (id) => opened.push(id) });
   const fav = html.slice(at(html, 'data-section="favorites"'));
-  assert.deepEqual([...fav.matchAll(/data-favorite="([^"]+)"/g)].map((m) => m[1]).slice(0, 3), ["chat:chat_pip", "thread:t1", "people"], "the gone ones skipped");
+  assert.deepEqual([...fav.matchAll(/data-favorite="([^"]+)"/g)].map((m) => m[1]).slice(0, 4), ["chat:chat_pip", "thread:t1", "thread:t2", "people"], "the gone ones skipped, a dismissed one kept");
   assert.match(fav, /data-favorite="chat:chat_pip"[^]*?>Pip</, "the chat by its name");
   assert.match(fav, /data-favorite="thread:t1"[^]*?>Check the field guide PDF</, "the thread by its title");
   const signedOut = render({ ...state, account: undefined });
