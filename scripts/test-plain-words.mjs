@@ -1,7 +1,7 @@
 // Tests for lib/plain-words.ts: what a bot's words and steps say to someone who isn't a developer.
 // Usage: node --experimental-strip-types scripts/test-plain-words.mjs
 import assert from "node:assert/strict";
-import { dropCitations, plainStep } from "../lib/plain-words.ts";
+import { dropCitations, isLocalLink, localOnlyLine, plainStep, plainTitle } from "../lib/plain-words.ts";
 
 let passed = 0;
 const check = (name, fn) => {
@@ -29,6 +29,26 @@ check("steps are said as a person would", () => {
   assert.equal(plainStep("ran git commit -m fix"), "Ran a command", "nor is a commit looking at history");
   assert.equal(plainStep("Read https://fourcorners.brandlord.agency/start?redirect=%2F"), "Read fourcorners.brandlord.agency");
   assert.equal(plainStep("Check the corrected draft itinerary"), "Check the corrected draft itinerary", "a step already in words stays");
+});
+
+check("a thread's title says where an app's copy runs, its computer, not Local or localhost; the rest stays", () => {
+  assert.equal(plainTitle("Run Four Corners Local"), "Run Four Corners on its computer");
+  assert.equal(plainTitle("Show Four Corners locally"), "Show Four Corners on its computer");
+  assert.equal(plainTitle("Open the brochure on localhost:3101"), "Open the brochure on its computer");
+  assert.equal(plainTitle("Check http://localhost:3000/start for the cover"), "Check its computer for the cover");
+  assert.equal(plainTitle("Four Corners draft brochure"), "Four Corners draft brochure", "already plain");
+  assert.equal(plainTitle("Local news digest"), "Local news digest", "Local only where it ends the title");
+  assert.equal(plainTitle("Call the local printer"), "Call the local printer");
+  assert.equal(plainTitle("Check localhost:3000?view=home"), "Check its computer");
+  assert.equal(plainTitle("Open localhost:3000. Then check the cover"), "Open its computer. Then check the cover", "a full stop after the port ends it");
+  assert.equal(plainTitle("Read http://localhost.example.com/docs"), "Read http://localhost.example.com/docs", "another host stays");
+});
+
+check("a localhost link is one to the computer it runs on, and says so", () => {
+  for (const href of ["http://localhost:3101/", "http://localhost", "https://127.0.0.1:8080/x?y", "http://LOCALHOST:3000#a"]) assert.ok(isLocalLink(href), href);
+  for (const href of ["https://fourcorners.brandlord.agency", "http://localhost.example.com/", "/api/pages/x", "http://127.0.0.12/"]) assert.ok(!isLocalLink(href), href);
+  assert.equal(localOnlyLine("Orgo team"), "opens only on Orgo team's computer");
+  assert.equal(localOnlyLine(undefined), "opens only on the bot's computer");
 });
 
 console.log(`\nplain words: ${passed} passed`);

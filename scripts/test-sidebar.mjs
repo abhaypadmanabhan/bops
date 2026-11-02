@@ -289,6 +289,13 @@ await test("A routine's post on a row says which routine, as the chat does above
   assert.match(render(world({ routines, messages: [post()] })), />someone@example\.com requests cancellation</, "a bot's own reply as before");
 });
 
+await test("A thread's row says its title in plain words (an app's copy on its computer, not Local), the stored title as it was", () => {
+  const t = session("t9", "nova", { title: "Run Four Corners Local" });
+  const html = render(world({ sessions: [t] }), { search: "four" });
+  assert.match(html, /data-thread="t9"[^>]*>(?:(?!<\/button>)[\s\S])*>Run Four Corners on its computer</);
+  assert.equal(t.title, "Run Four Corners Local");
+});
+
 /* ---------------- Favorites ---------------- */
 
 await test("Favorites: nothing until the user pins something (no section), then their list in their order", () => {

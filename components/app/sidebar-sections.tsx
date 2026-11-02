@@ -17,6 +17,7 @@ import { KeyIcon } from "./screen-cards";
 import { SETUP_NEEDS, type SetupItem } from "./setup";
 import { arrived, Chevron, Count, DeleteX, readSectionOpen, undash, usePop, useRise, writeSectionOpen } from "./side-group";
 import { SkillsIcon } from "./skills";
+import { plainTitle } from "@/lib/plain-words";
 import { ago, chatName, currentWorkspace, needsYou, NeedsYouDot, post, quietNothing, StatusIcon } from "./ui";
 
 /*
@@ -110,7 +111,7 @@ export function ThreadRow({ session: s, onClick, readOnly, okWait, onMenu }: { s
       data-thread={s.id}
       className={`group/thread flex h-[34px] shrink-0 items-center gap-2 rounded-[10px] px-2.5 text-left outline-none hover:bg-black/[0.03] focus-visible:shadow-[inset_0_0_0_1.5px_#0A0A0A] ${row.rise ? "motion-rise-in" : ""}`}
     >
-      <span className={`min-w-0 flex-1 truncate text-[14px] leading-[18px] ${live(s) || needsYou(s) ? "text-ink" : "text-[#6B6B6B]"}`}>{s.title}</span>
+      <span className={`min-w-0 flex-1 truncate text-[14px] leading-[18px] ${live(s) || needsYou(s) ? "text-ink" : "text-[#6B6B6B]"}`}>{plainTitle(s.title)}</span>
       {(live(s) || needsYou(s)) && (
         <span key={pop.n} onAnimationEnd={pop.done} className={`flex shrink-0 ${pop.pop ? "motion-dot-in" : ""}`}>
           <StatusIcon session={s} owner={readOnly} okWait={okWait} />

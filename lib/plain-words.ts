@@ -9,6 +9,23 @@
  */
 export const dropCitations = (text: string) => text.replace(/\s?[^]*/g, "");
 
+/** A link to a page on the computer it runs on (localhost, 127.0.0.1): it opens there and nowhere else. */
+export const isLocalLink = (href: string) => /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#]|$)/i.test(href);
+
+/** What a bot's localhost link says in a workspace shared with the user, in place of opening: where it opens. */
+export const localOnlyLine = (botName?: string) => `opens only on ${botName ? `${botName}'s` : "the bot's"} computer`;
+
+/**
+ * A thread's title as the window shows it (the stored title stays as the bot wrote it): an app's copy running on
+ * the bot's computer ("Run Four Corners Local", "Show Four Corners locally") and a localhost address said as where
+ * they are, its computer.
+ */
+export function plainTitle(title: string): string {
+  return title
+    .replace(/\s+(?:local|locally|on localhost(?::\d+)?)$/i, " on its computer")
+    .replace(/(?:https?:\/\/)?\b(?:localhost|127\.0\.0\.1)(?::\d+)?(?![\w:-]|\.[\w-])(?:[/?#](?:[^\s]*[^\s.,;:!?])?)?/gi, "its computer");
+}
+
 /** A step's detail, as a person would say it. */
 export function plainStep(detail: string): string {
   const d = detail.trim();
