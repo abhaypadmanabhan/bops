@@ -39,6 +39,8 @@ check("a thread's title says where an app's copy runs, its computer, not Local o
   assert.equal(plainTitle("Four Corners draft brochure"), "Four Corners draft brochure", "already plain");
   assert.equal(plainTitle("Local news digest"), "Local news digest", "Local only where it ends the title");
   assert.equal(plainTitle("Call the local printer"), "Call the local printer");
+  assert.equal(plainTitle("Check localhost:3000?view=home"), "Check its computer");
+  assert.equal(plainTitle("Read http://localhost.example.com/docs"), "Read http://localhost.example.com/docs", "another host stays");
 });
 
 check("a localhost link is one to the computer it runs on, and says so", () => {
